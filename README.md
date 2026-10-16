@@ -39,6 +39,11 @@
 | `owner_directive` | `content`（必填）、`chat`（群号 / 代号，留空=当前聊天流） | 下达叮嘱 |
 | `owner_chat_alias` | `action`（set / remove / list）、`alias`、`group` | 维护群代号 |
 
+> 实现注意：SDK 的 `collect_components` 只对 ReplyExtension 把 `chat_scope` 提到组件声明的**顶层**，
+> 而 Runner 读的正是顶层（`runner_main.py:1420`）。所以本插件覆写了 `get_components()` 做这次提升——
+> 只写进 `@Tool(..., chat_scope="private")` 的 metadata 是**不会生效**的（会被当成 `all`）。
+> 已用宿主真实的 `ComponentRegistry` 验证：群聊工具表 `[]`，私聊工具表含这两个工具。
+
 - 只有主人（`owner.owners`）能用；非主人调用返回中性的「没有权限执行该操作。」
 - `owner_directive` 的参数说明里写死了边界：**只有主人明确要求时才调用**、**`content` 只写意图、不要搬运私聊原文**；
 - 用 `chat_scope=private` + 权限校验双保险，避免"她自作主张影响别的群"。
@@ -174,6 +179,7 @@ python -m unittest discover -s tests -v
 | 命令 → 落盘链路 | ✅ | 生产 `data/plugins/yeye.owner-reminder/reminders.json` 里留下真实叮嘱，目标群名、真实 session_id、下达者 `qq:1215349250` 都正确 |
 | 主人的私聊识别 | ✅ | 加载日志里解析出 `主人的私聊=['3695a82e4db39ede9f14040523ab13b4']` |
 | 二期代码热加载 | ✅ | 日志 `插件 yeye.owner-reminder v0.2.0 加载成功`（工具与代号表随之生效） |
+| 工具会话作用域 | ✅ | 用宿主真实 `ComponentRegistry` 注册本插件声明后查询：群聊工具表 `[]`、私聊工具表含两个工具 |
 | 主观效果 | ✅ | 主人确认"效果很好" |
 | 自然语言通道 | ⏳ 待你实测 | 单元测试已覆盖，但真机上还没实际说过一句自然语言下达 |
 
