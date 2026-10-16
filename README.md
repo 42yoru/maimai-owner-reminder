@@ -112,21 +112,27 @@ python -m unittest discover -s tests -v
 目标解析失败与多命中消歧、账号不匹配报错、`ask` / `silent` 分支、非主人静默忽略、
 列表/撤销、同目标超上限替换、状态文件损坏与缺字段时报错、`config.toml` 与配置模型一致性。
 
-## 已验证 / 尚未验证
+## 验证状态
 
-**已验证（在本机 1.3.9 上）**
+**单元测试**：`python -m unittest discover -s tests` → 62 项全绿（stdlib `unittest`，无额外依赖）。
 
-- `_manifest.json` 通过宿主真实的 `ManifestValidator`（id、能力声明、版本区间都合法）；
-- 注入的尾部 `SystemMessageItem` 交给宿主真实的 `deserialize_prompt_items()` 能正常反序列化并通过
-  `validate_context_items()` —— 该校验对 system item 的位置**没有**约束，只查 item_id 与工具调用配对。
-  复现方式：把 `MAIBOT_INSTANCE_DIR` 指向实例目录后 `from src.plugin_runtime.hook_payloads import
-  deserialize_prompt_items`，用 `plugin._build_system_item(...)` 的返回值调一次即可
+**本机 1.3.9 真机验证（2026-10-16）**
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| manifest 合法性 | ✅ | 宿主真实 `ManifestValidator` 校验通过 |
+| 注入项结构 | ✅ | 宿主真实 `deserialize_prompt_items()` 反序列化通过，`validate_context_items()` 无告警 |
+| 尾部 system item 是否被 provider 接受 | ✅ | 日志 **16 次** `主人叮嘱已注入`，**0 次** `Hook maisaka.planner.before_request 返回的 items 无效` |
+| 前缀缓存是否受影响 | ✅ 未见退化 | 注入窗口内命中率中位数 **96.01%**，窗口前 **94.65%**；两段各有一个 0.00% 冷启动样本拉低了均值 |
+| 命令 → 落盘链路 | ✅ | 生产 `data/plugins/yeye.owner-reminder/reminders.json` 里留下真实叮嘱，目标群名、真实 session_id、下达者 `qq:1215349250` 都正确 |
+| 主观效果 | ✅ | 主人确认"效果很好" |
+
+**仍需留意**
+
+- 缓存统计样本量偏小（注入窗口内 7 次 planner 调用），结论是"没看到退化"，不是严格的性能回归测试。
+- 目标解析目前是唯一命中。若以后又出现重复聊天流，插件会**直接报错并提示配 `target.account_id`**，
+  不会自己挑一条；一旦配了账号，则一律要求账号一致。
+- 复现"注入项结构"那项校验的方式：把 `MAIBOT_INSTANCE_DIR` 指向实例目录后
+  `from src.plugin_runtime.hook_payloads import deserialize_prompt_items`，
+  用 `plugin._build_system_item(...)` 的返回值调一次即可
   （注意：这条会连带启动 MaiBot 的配置与数据库初始化，所以没有放进单元测试）。
-
-**尚未验证（需要真机跑一轮）**
-
-- 两个 provider（`deepseek-flash` / `rinko-deepseek-v4.1-flash`）是否都接受**尾部追加的 system item**。
-  若日志出现 `Hook maisaka.planner.before_request 返回的 items 无效`，就把注入位置退化为
-  "插到最后一条 user 消息之前"（前缀缓存收益略降）。
-- planner 前缀缓存命中率是否维持原有水平。
-- 插件本身尚未在这台实例上加载过（`plugins/yeye_owner_reminder/` 会在下次 MaiBot 重启时被发现）。
