@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
+from .alias_store import ChatAlias
 from .reminder_store import Reminder, ReminderStage
 
 INJECT_ITEM_ID_PREFIX = "owner_reminder_"
+OWNER_NOTE_ITEM_PREFIX = "owner_reminder_owner_note_"
 
 COMMAND_PREFIX = "/叮嘱"
 COMMAND_ALIAS_HINT = "（别名 /influence）"
@@ -94,11 +96,15 @@ def build_created_receipt(
     truncated: bool,
     evicted: Sequence[Reminder],
     dispatch_note: str,
+    alias_name: str = "",
 ) -> str:
-    """生成下达成功的回执。"""
+    """生成下达成功的回执；用代号下达时把代号一起写出来。"""
 
+    target_part = (
+        f"《{alias_name}》「{reminder.target_label}」" if alias_name else f"「{reminder.target_label}」"
+    )
     lines = [
-        f"✅ 已记下叮嘱 #{reminder.id}（作用于「{reminder.target_label}」）",
+        f"✅ 已记下叮嘱 #{reminder.id}（作用于{target_part}）",
         f"   生效 {ttl_seconds / 60:.0f} 分钟，之后自动淡出。查看：{COMMAND_PREFIX}列表",
     ]
     if truncated:
@@ -142,3 +148,90 @@ def build_missing_reminder_text(reminder_id: str) -> str:
     """生成找不到指定编号的提示。"""
 
     return f"❌ 没有找到编号为 {reminder_id} 的叮嘱（可能已到期或被替换）。用 {COMMAND_PREFIX}列表 查看现有条目。"
+
+
+# ──── 群代号 ────
+
+
+def format_alias_table(aliases: Sequence[ChatAlias]) -> str:
+    """把代号表压缩成一行对照文本。"""
+
+    return "、".join(
+        f"{item.name}={item.group_id}" + (f"（{item.group_label}）" if item.group_label else "")
+        for item in aliases
+    )
+
+
+def build_alias_list_text(aliases: Sequence[ChatAlias]) -> str:
+    """生成代号表文本。"""
+
+    if not aliases:
+        return "📇 还没有设置任何群代号。可以说「把 943355126 叫做夜羊群」来加一个。"
+    lines = [f"📇 群代号（{len(aliases)} 个）"]
+    for item in aliases:
+        label = f"（{item.group_label}）" if item.group_label else ""
+        lines.append(f"  {item.name} = {item.group_id}{label}")
+    return "\n".join(lines)
+
+
+def build_unknown_alias_text(name: str, aliases: Sequence[ChatAlias]) -> str:
+    """生成"代号不存在"的提示，并把可用代号一并给出，方便模型自己纠正。"""
+
+    if not aliases:
+        return f"没有找到代号「{name}」，目前也还没有设置任何群代号；请直接给群号。"
+    return f"没有找到代号「{name}」。当前可用代号：{format_alias_table(aliases)}；也可以直接给群号。"
+
+
+def build_alias_saved_text(alias: ChatAlias) -> str:
+    """生成代号保存成功的文本。"""
+
+    label = f"（{alias.group_label}）" if alias.group_label else ""
+    return f"✅ 记住了：以后「{alias.name}」就是指群 {alias.group_id}{label}。"
+
+
+def build_alias_removed_text(alias: ChatAlias) -> str:
+    """生成代号删除成功的文本。"""
+
+    return f"✅ 已删除代号「{alias.name}」（原来是群 {alias.group_id}）。"
+
+
+def build_alias_missing_text(name: str, aliases: Sequence[ChatAlias]) -> str:
+    """生成删除时找不到代号的文本。"""
+
+    if not aliases:
+        return f"没有代号「{name}」，当前也没有任何代号。"
+    return f"没有代号「{name}」。当前代号：{format_alias_table(aliases)}。"
+
+
+def build_unknown_alias_action_text(action: str) -> str:
+    """生成不认识的代号操作提示。"""
+
+    return f"不认识的 action「{action}」：只支持 set / remove / list。"
+
+
+def build_owner_alias_note(aliases: Sequence[ChatAlias]) -> str:
+    """生成注入到主人私聊里的代号对照 + 工具提示。"""
+
+    return (
+        "【主人私聊·跨聊天流影响】主人要你影响别的聊天流时，用 owner_directive 工具，"
+        "chat 填群号或下面这些代号（留空表示当前聊天流）。\n"
+        f"群代号：{format_alias_table(aliases)}"
+    )
+
+
+def build_tool_disabled_text() -> str:
+    """生成工具被关闭时的提示。"""
+
+    return "跨聊天流影响功能当前已关闭（插件配置 tool.enabled = false）。"
+
+
+def build_missing_content_text() -> str:
+    """生成缺少叮嘱内容的提示。"""
+
+    return "缺少叮嘱内容：请把主人想传达的意思作为 content 传进来。"
+
+
+def build_not_owner_text() -> str:
+    """生成非主人调用的中性提示（不暴露机制）。"""
+
+    return "没有权限执行该操作。"

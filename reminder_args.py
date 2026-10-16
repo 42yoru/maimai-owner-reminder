@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 HERE_MARKER = "@here"
 LIST_WORDS = ("列表", "list")
@@ -34,7 +35,7 @@ class CommandRequest:
         return not self.error
 
 
-def parse_command(rest: str) -> CommandRequest:
+def parse_command(rest: str, *, is_alias: Optional[Callable[[str], bool]] = None) -> CommandRequest:
     """解析命令词之后的整段原文。
 
     规则：
@@ -42,11 +43,14 @@ def parse_command(rest: str) -> CommandRequest:
     - 首个 token 是 ``列表`` / ``list`` → 查看当前生效的叮嘱；
     - 首个 token 是 ``撤销`` / ``revoke`` → 撤销，后面的 token 是编号或 all；
     - 首个 token 是纯数字 → 它是目标群号，其后是叮嘱内容；
+    - 首个 token 被 ``is_alias`` 认作代号 → 它是目标代号，其后是叮嘱内容；
     - 首个 token 是 ``@here`` → 目标是当前聊天流，其后是叮嘱内容；
     - 其他情况 → 目标是当前聊天流，整段都是叮嘱内容。
 
     Args:
         rest: 命令词之后、已去掉首尾空白的原文。
+        is_alias: 可选的"这个 token 是不是已登记的群代号"判断函数；
+            不传时只认群号。
 
     Returns:
         CommandRequest: 动作与参数，或错误原因。
@@ -80,6 +84,11 @@ def parse_command(rest: str) -> CommandRequest:
     if head.isascii() and head.isdigit():
         if not tail:
             return CommandRequest(error=f"群号 {head} 后面缺少叮嘱内容")
+        return CommandRequest(target_group_id=head, content=tail)
+
+    if is_alias is not None and is_alias(head):
+        if not tail:
+            return CommandRequest(error=f"代号 {head} 后面缺少叮嘱内容")
         return CommandRequest(target_group_id=head, content=tail)
 
     return CommandRequest(content=text)

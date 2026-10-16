@@ -58,6 +58,7 @@ def _load_plugin_module() -> Any:
 
 
 PLUGIN_MODULE = _load_plugin_module()
+ALIAS_MODULE = sys.modules[f"{MODULE_NAME}.alias_store"]
 ARGS_MODULE = sys.modules[f"{MODULE_NAME}.reminder_args"]
 STORE_MODULE = sys.modules[f"{MODULE_NAME}.reminder_store"]
 TEXT_MODULE = sys.modules[f"{MODULE_NAME}.reminder_text"]
@@ -754,6 +755,28 @@ class CommandComponentTestCase(TestCase):
         self.assertEqual(inject_metadata["mode"], "blocking")
         self.assertEqual(inject_metadata["order"], "late")
 
+    def test_tools_are_declared_private_scoped(self) -> None:
+        """两个自然语言工具都必须把 chat_scope=private 暴露在**顶层**。
+
+        Runner 读的是顶层 `chat_scope`（`runner_main.py:1420`），不是 metadata 里的，
+        所以这里按 Runner 的读法断言，避免"写在 metadata 里看起来对、实际不生效"。
+        """
+
+        components = {
+            component["name"]: component
+            for component in PLUGIN_MODULE.OwnerReminderPlugin().get_components()
+            if component["type"] == ComponentType.TOOL.value
+        }
+
+        self.assertEqual(sorted(components), ["owner_chat_alias", "owner_directive"])
+        for component in components.values():
+            self.assertEqual(component.get("chat_scope", "all"), "private")
+        directive_description = components["owner_directive"]["metadata"]["description"]
+        self.assertIn("主人", directive_description)
+        self.assertIn("不要搬运私聊原文", directive_description)
+        self.assertTrue(components["owner_directive"]["metadata"]["parameters"])
+        self.assertTrue(components["owner_chat_alias"]["metadata"]["parameters"])
+
 
 class ArgumentParseTestCase(TestCase):
     """命令参数解析。"""
@@ -819,6 +842,28 @@ class ArgumentParseTestCase(TestCase):
         self.assertTrue(ARGS_MODULE.is_revoke_all("all"))
         self.assertTrue(ARGS_MODULE.is_revoke_all("全部"))
         self.assertFalse(ARGS_MODULE.is_revoke_all("a1b2"))
+
+    def test_alias_aware_target_parsing(self) -> None:
+        """传入 is_alias 后，首个 token 是代号时也当成目标。"""
+
+        known = {"夜羊群"}
+        parsed = ARGS_MODULE.parse_command("夜羊群 别吵了", is_alias=known.__contains__)
+        self.assertTrue(parsed.ok)
+        self.assertEqual(parsed.target_group_id, "夜羊群")
+        self.assertEqual(parsed.content, "别吵了")
+
+        missing_content = ARGS_MODULE.parse_command("夜羊群", is_alias=known.__contains__)
+        self.assertFalse(missing_content.ok)
+        self.assertIn("后面缺少叮嘱内容", missing_content.error)
+
+        # 不认识的 token 仍然按"作用于当前聊天流"处理
+        plain = ARGS_MODULE.parse_command("别跟那个人吵了", is_alias=known.__contains__)
+        self.assertEqual(plain.target_group_id, "")
+        self.assertEqual(plain.content, "别跟那个人吵了")
+
+        # 子命令优先级高于代号
+        listed = ARGS_MODULE.parse_command("列表", is_alias=known.__contains__)
+        self.assertEqual(listed.action, ARGS_MODULE.ACTION_LIST)
 
 
 class StoreTestCase(TestCase):
@@ -935,6 +980,487 @@ class StoreTestCase(TestCase):
         self.assertEqual(self.store.active_all(1002.0), [])
 
 
+class AliasAndToolTestCase(PluginTestCase):
+    """二期：自然语言工具与群代号。"""
+
+    @staticmethod
+    def tool_kwargs(
+        *,
+        user_id: str = OWNER_ID,
+        stream_id: str = ISSUER_SESSION,
+        group_id: str = "",
+    ) -> Dict[str, Any]:
+        """构造工具调用参数，模拟宿主补齐的会话上下文。"""
+
+        return {
+            "stream_id": stream_id,
+            "chat_id": stream_id,
+            "group_id": group_id,
+            "platform": PLATFORM,
+            "user_id": user_id,
+        }
+
+    def read_aliases(self) -> Dict[str, Any]:
+        """读取代号表原始内容。"""
+
+        return json.loads((self.tmp_dir / "aliases.json").read_text(encoding="utf-8"))
+
+    # ──── 代号维护 ────
+
+    async def test_alias_set_list_remove(self) -> None:
+        """代号的增、查、删。"""
+
+        plugin = await self.build_plugin()
+
+        saved = await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+        self.assertTrue(saved["success"])
+        self.assertIn("记住了", saved["content"])
+        self.assertIn("夜羊群", saved["content"])
+        self.assertEqual(self.read_aliases()["version"], 1)
+        entry = self.read_aliases()["aliases"][0]
+        self.assertEqual(entry["name"], "夜羊群")
+        self.assertEqual(entry["group_id"], GROUP_ID)
+        self.assertEqual(entry["group_label"], GROUP_NAME)
+        self.assertEqual(entry["platform"], PLATFORM)
+
+        listed = await plugin.handle_owner_chat_alias(action="list", **self.tool_kwargs())
+        self.assertTrue(listed["success"])
+        self.assertIn("群代号（1 个）", listed["content"])
+        self.assertIn(f"夜羊群 = {GROUP_ID}", listed["content"])
+        self.assertIn(GROUP_NAME, listed["content"])
+
+        removed = await plugin.handle_owner_chat_alias(
+            action="remove", alias="夜羊群", **self.tool_kwargs()
+        )
+        self.assertTrue(removed["success"])
+        self.assertIn("已删除代号", removed["content"])
+        self.assertEqual(self.read_aliases()["aliases"], [])
+
+        again = await plugin.handle_owner_chat_alias(
+            action="remove", alias="夜羊群", **self.tool_kwargs()
+        )
+        self.assertFalse(again["success"])
+        self.assertIn("没有代号", again["content"])
+
+    async def test_alias_list_empty_and_default_action(self) -> None:
+        """没有代号时的列表提示；action 空串按列表处理。"""
+
+        plugin = await self.build_plugin()
+
+        result = await plugin.handle_owner_chat_alias(**self.tool_kwargs())
+
+        self.assertTrue(result["success"])
+        self.assertIn("还没有设置任何群代号", result["content"])
+
+    async def test_alias_set_rejects_bad_name(self) -> None:
+        """纯数字、带空白、过长的代号都要被拒绝。"""
+
+        plugin = await self.build_plugin()
+
+        numeric = await plugin.handle_owner_chat_alias(
+            action="set", alias="123456", group=GROUP_ID, **self.tool_kwargs()
+        )
+        self.assertFalse(numeric["success"])
+        self.assertIn("纯数字", numeric["content"])
+
+        spaced = await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊 群", group=GROUP_ID, **self.tool_kwargs()
+        )
+        self.assertFalse(spaced["success"])
+        self.assertIn("空格", spaced["content"])
+
+        too_long = await plugin.handle_owner_chat_alias(
+            action="set", alias="代" * 21, group=GROUP_ID, **self.tool_kwargs()
+        )
+        self.assertFalse(too_long["success"])
+        self.assertIn("不能超过", too_long["content"])
+
+        self.assertFalse((self.tmp_dir / "aliases.json").exists())
+
+    async def test_alias_set_requires_existing_group(self) -> None:
+        """群号不存在时不许登记代号。"""
+
+        self.host.group_streams = []
+        plugin = await self.build_plugin()
+
+        result = await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("没有找到群", result["content"])
+        self.assertFalse((self.tmp_dir / "aliases.json").exists())
+
+    async def test_alias_set_overwrites_same_name(self) -> None:
+        """同名代号是覆盖，不是叠加。"""
+
+        self.host.group_streams = [
+            {
+                "session_id": TARGET_SESSION,
+                "group_id": GROUP_ID,
+                "group_name": GROUP_NAME,
+                "account_id": "10001",
+                "platform": PLATFORM,
+            },
+            {
+                "session_id": DUPLICATE_SESSION,
+                "group_id": "982628545",
+                "group_name": "另一个群",
+                "account_id": "10001",
+                "platform": PLATFORM,
+            },
+        ]
+        plugin = await self.build_plugin()
+
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group="982628545", **self.tool_kwargs()
+        )
+
+        aliases = self.read_aliases()["aliases"]
+        self.assertEqual(len(aliases), 1)
+        self.assertEqual(aliases[0]["group_id"], "982628545")
+
+    async def test_alias_unknown_action(self) -> None:
+        """不认识的 action 要明确报错。"""
+
+        plugin = await self.build_plugin()
+
+        result = await plugin.handle_owner_chat_alias(action="rename", **self.tool_kwargs())
+
+        self.assertFalse(result["success"])
+        self.assertIn("只支持 set / remove / list", result["content"])
+
+    async def test_tools_reject_non_owner(self) -> None:
+        """非主人调用两个工具：一律拒绝且不落盘。"""
+
+        plugin = await self.build_plugin()
+        outsider = self.tool_kwargs(user_id=NON_OWNER_ID)
+
+        directive = await plugin.handle_owner_directive(content="别吵了", chat=GROUP_ID, **outsider)
+        alias = await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **outsider
+        )
+
+        self.assertFalse(directive["success"])
+        self.assertFalse(alias["success"])
+        self.assertEqual(directive["content"], "没有权限执行该操作。")
+        self.assertEqual(alias["content"], "没有权限执行该操作。")
+        self.assertFalse(self.store_path().exists())
+        self.assertFalse((self.tmp_dir / "aliases.json").exists())
+
+    async def test_tools_can_be_disabled(self) -> None:
+        """tool.enabled=false 时两个工具都拒绝执行。"""
+
+        plugin = await self.build_plugin(tool={"enabled": False})
+
+        directive = await plugin.handle_owner_directive(content="别吵了", **self.tool_kwargs())
+        alias = await plugin.handle_owner_chat_alias(action="list", **self.tool_kwargs())
+
+        self.assertFalse(directive["success"])
+        self.assertFalse(alias["success"])
+        self.assertIn("已关闭", directive["content"])
+        self.assertFalse(self.store_path().exists())
+
+    # ──── 自然语言下达 ────
+
+    async def test_directive_tool_with_alias(self) -> None:
+        """用代号下达：落到代号对应的真实聊天流，回执里带上代号。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+
+        result = await plugin.handle_owner_directive(
+            content="别继续和某人争执，语气放软", chat="夜羊群", **self.tool_kwargs()
+        )
+
+        self.assertTrue(result["success"])
+        self.assertIn("《夜羊群》", result["content"])
+        self.assertIn(GROUP_NAME, result["content"])
+
+        payload = self.read_store()
+        self.assertEqual(len(payload["reminders"]), 1)
+        saved = payload["reminders"][0]
+        self.assertEqual(saved["target_session_id"], TARGET_SESSION)
+        self.assertEqual(saved["content"], "别继续和某人争执，语气放软")
+        self.assertEqual(saved["issuer"], OWNER)
+        self.assertEqual(saved["source_session_id"], ISSUER_SESSION)
+        self.assertEqual(len(self.host.proactive_calls), 1)
+        self.assertIn("别继续和某人争执", self.host.proactive_calls[0]["intent"])
+
+    async def test_directive_tool_accepts_group_id_and_defaults(self) -> None:
+        """chat 参数：群号可用；留空则作用于当前聊天流。"""
+
+        plugin = await self.build_plugin()
+
+        by_id = await plugin.handle_owner_directive(
+            content="别吵了", chat=GROUP_ID, **self.tool_kwargs()
+        )
+        self.assertTrue(by_id["success"])
+        self.assertEqual(self.read_store()["reminders"][0]["target_session_id"], TARGET_SESSION)
+
+        current = await plugin.handle_owner_directive(content="早点睡", **self.tool_kwargs())
+        self.assertTrue(current["success"])
+        targets = [item["target_session_id"] for item in self.read_store()["reminders"]]
+        self.assertIn(ISSUER_SESSION, targets)
+
+    async def test_directive_tool_unknown_alias_lists_available(self) -> None:
+        """代号不认识时，把可用代号回给模型，便于自己纠正。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+
+        result = await plugin.handle_owner_directive(
+            content="别吵了", chat="羊群", **self.tool_kwargs()
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("没有找到代号「羊群」", result["content"])
+        self.assertIn("夜羊群", result["content"])
+        self.assertFalse(self.store_path().exists())
+
+    async def test_directive_tool_without_any_alias(self) -> None:
+        """一条代号都没有时，明确提示直接给群号。"""
+
+        plugin = await self.build_plugin()
+
+        result = await plugin.handle_owner_directive(
+            content="别吵了", chat="羊群", **self.tool_kwargs()
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("还没有设置任何群代号", result["content"])
+
+    async def test_directive_tool_requires_content(self) -> None:
+        """缺少 content 时明确报错，不落盘。"""
+
+        plugin = await self.build_plugin()
+
+        result = await plugin.handle_owner_directive(chat=GROUP_ID, **self.tool_kwargs())
+
+        self.assertFalse(result["success"])
+        self.assertIn("缺少叮嘱内容", result["content"])
+        self.assertFalse(self.store_path().exists())
+
+    async def test_tool_and_command_write_same_shape(self) -> None:
+        """两条通道落盘结构一致（同一份实现）。"""
+
+        plugin = await self.build_plugin()
+
+        await plugin.handle_owner_directive(
+            content="工具下达", chat=GROUP_ID, **self.tool_kwargs()
+        )
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 命令下达"))
+
+        reminders = self.read_store()["reminders"]
+        self.assertEqual(len(reminders), 2)
+        self.assertEqual(set(reminders[0]), set(reminders[1]))
+        self.assertEqual(reminders[0]["issuer"], reminders[1]["issuer"])
+        self.assertEqual(reminders[0]["source_session_id"], reminders[1]["source_session_id"])
+        self.assertEqual(
+            [item["content"] for item in reminders], ["工具下达", "命令下达"]
+        )
+
+    async def test_command_accepts_alias_too(self) -> None:
+        """/叮嘱 也支持用代号指定目标。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+
+        success, _, _ = await plugin.handle_owner_reminder(
+            **self.command_kwargs("夜羊群 别吵了")
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(self.read_store()["reminders"][0]["target_session_id"], TARGET_SESSION)
+        self.assertIn("《夜羊群》", self.host.last_receipt)
+
+    # ──── 主人私聊里的代号对照注入 ────
+
+    async def test_owner_note_injected_in_owner_private_chat(self) -> None:
+        """主人私聊 + 有代号 → 恰好注入一条代号对照。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+        items = self.sample_items()
+
+        result = await plugin.inject_owner_reminder(
+            session_id=ISSUER_SESSION, items=items, item_schema_version=1
+        )
+
+        modified = result["modified_kwargs"]["items"]
+        self.assertEqual(len(modified), len(items) + 1)
+        note = modified[-1]["parts"][0]["text"]
+        self.assertIn("群代号", note)
+        self.assertIn("owner_directive", note)
+        self.assertIn(f"夜羊群={GROUP_ID}", note)
+
+    async def test_owner_note_absent_without_alias(self) -> None:
+        """没有代号时主人私聊也零改动。"""
+
+        plugin = await self.build_plugin()
+        items = self.sample_items()
+
+        result = await plugin.inject_owner_reminder(
+            session_id=ISSUER_SESSION, items=items, item_schema_version=1
+        )
+
+        self.assertEqual(result["modified_kwargs"]["items"], items)
+
+    async def test_owner_note_absent_in_group_and_other_sessions(self) -> None:
+        """群聊或别人的私聊都拿不到代号对照。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+
+        group_items = self.sample_items()
+        group_result = await plugin.inject_owner_reminder(
+            session_id=TARGET_SESSION, items=group_items, item_schema_version=1
+        )
+        outsider_items = self.sample_items()
+        outsider_result = await plugin.inject_owner_reminder(
+            session_id="someone-else-private", items=outsider_items, item_schema_version=1
+        )
+
+        self.assertEqual(group_result["modified_kwargs"]["items"], group_items)
+        self.assertEqual(outsider_result["modified_kwargs"]["items"], outsider_items)
+
+    async def test_owner_note_can_be_switched_off(self) -> None:
+        """alias.inject_into_owner_chat=false 时不注入。"""
+
+        plugin = await self.build_plugin(alias={"inject_into_owner_chat": False})
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+        items = self.sample_items()
+
+        result = await plugin.inject_owner_reminder(
+            session_id=ISSUER_SESSION, items=items, item_schema_version=1
+        )
+
+        self.assertEqual(result["modified_kwargs"]["items"], items)
+
+    async def test_owner_session_learned_from_tool_call(self) -> None:
+        """加载时解析不到主人私聊也没关系：调用一次工具就自我补全。"""
+
+        self.host.private_streams = []
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+        items = self.sample_items()
+
+        result = await plugin.inject_owner_reminder(
+            session_id=ISSUER_SESSION, items=items, item_schema_version=1
+        )
+
+        self.assertEqual(len(result["modified_kwargs"]["items"]), len(items) + 1)
+        self.assertIn("群代号", result["modified_kwargs"]["items"][-1]["parts"][0]["text"])
+
+    async def test_directive_and_owner_note_are_separate_items(self) -> None:
+        """目标流拿叮嘱，主人私聊拿对照表，互不串台。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+        )
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
+
+        target_items = self.sample_items()
+        target_result = await plugin.inject_owner_reminder(
+            session_id=TARGET_SESSION, items=target_items, item_schema_version=1
+        )
+        owner_result = await plugin.inject_owner_reminder(
+            session_id=ISSUER_SESSION, items=self.sample_items(), item_schema_version=1
+        )
+
+        target_note = target_result["modified_kwargs"]["items"][-1]["parts"][0]["text"]
+        owner_note = owner_result["modified_kwargs"]["items"][-1]["parts"][0]["text"]
+        self.assertIn("主人刚特意交代过", target_note)
+        self.assertNotIn("群代号", target_note)
+        self.assertIn("群代号", owner_note)
+        self.assertNotIn("主人刚特意交代过", owner_note)
+
+
+class AliasStoreTestCase(TestCase):
+    """代号表的存储层。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = ALIAS_MODULE.AliasStore(Path(self._tmp.name))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_set_find_and_case_insensitive_lookup(self) -> None:
+        """大小写不敏感地查找代号。"""
+
+        self.store.set(
+            name="YeYang", group_id=GROUP_ID, platform=PLATFORM, group_label=GROUP_NAME, now=1.0
+        )
+
+        self.assertIsNotNone(self.store.find("yeyang"))
+        self.assertIsNotNone(self.store.find("  YEYANG  "))
+        self.assertIsNone(self.store.find("other"))
+
+    def test_all_is_sorted(self) -> None:
+        """列表按代号排序，写入顺序不影响。"""
+
+        for name in ("丙群", "甲群", "乙群"):
+            self.store.set(
+                name=name, group_id=GROUP_ID, platform=PLATFORM, group_label="", now=1.0
+            )
+
+        self.assertEqual([item.name for item in self.store.all()], ["丙群", "乙群", "甲群"])
+
+    def test_state_survives_reload_and_leaves_no_temp(self) -> None:
+        """重启后代号还在，且不遗留临时文件。"""
+
+        self.store.set(
+            name="夜羊群", group_id=GROUP_ID, platform=PLATFORM, group_label=GROUP_NAME, now=1.0
+        )
+
+        reopened = ALIAS_MODULE.AliasStore(Path(self._tmp.name))
+        self.assertEqual([item.name for item in reopened.all()], ["夜羊群"])
+        self.assertEqual(
+            sorted(path.name for path in Path(self._tmp.name).iterdir()), ["aliases.json"]
+        )
+
+    def test_corrupt_and_version_mismatch_raise(self) -> None:
+        """损坏与版本不匹配都直接抛错。"""
+
+        self.store.path.write_text("{ 不是 JSON", encoding="utf-8")
+        with self.assertRaises(ALIAS_MODULE.AliasStoreError):
+            self.store.all()
+
+        self.store.path.write_text(json.dumps({"version": 99, "aliases": []}), encoding="utf-8")
+        with self.assertRaises(ALIAS_MODULE.AliasStoreError):
+            self.store.all()
+
+    def test_invalid_names_raise(self) -> None:
+        """非法代号直接抛错，不静默丢弃。"""
+
+        for name in ("", "12", "有 空格", "代" * 21):
+            with self.assertRaises(ALIAS_MODULE.AliasStoreError):
+                self.store.set(
+                    name=name, group_id=GROUP_ID, platform=PLATFORM, group_label="", now=1.0
+                )
+
+
 class ConfigFileTestCase(TestCase):
     """config.toml 必须与配置模型一致，否则宿主会在加载时自动改写它。"""
 
@@ -946,7 +1472,7 @@ class ConfigFileTestCase(TestCase):
 
         self.assertFalse(changed, f"config.toml 与配置模型不一致: {normalized}")
         self.assertTrue(normalized["plugin"]["enabled"])
-        self.assertEqual(normalized["plugin"]["config_version"], "0.1.0")
+        self.assertEqual(normalized["plugin"]["config_version"], "0.2.0")
         self.assertEqual(normalized["owner"]["owners"], ["qq:1215349250"])
         self.assertEqual(normalized["reminder"]["default_ttl_seconds"], 600)
         self.assertEqual(normalized["reminder"]["strong_ratio"], 0.33)
@@ -957,6 +1483,8 @@ class ConfigFileTestCase(TestCase):
         self.assertTrue(normalized["inject"]["enabled"])
         self.assertEqual(normalized["dispatch"]["mode"], "ask")
         self.assertIn("{内容}", normalized["dispatch"]["intent_template"])
+        self.assertTrue(normalized["tool"]["enabled"])
+        self.assertTrue(normalized["alias"]["inject_into_owner_chat"])
 
     def test_manifest_matches_config_version(self) -> None:
         manifest = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))

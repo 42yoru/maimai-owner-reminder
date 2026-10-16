@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "name": "主人的叮嘱 (Owner Reminder)",
-  "description": "主人在任意聊天流下达一条短期叮嘱，作用于指定的另一个聊天流：以强/弱两档影响她的 planner，到期自动淡出。纯插件实现，不改主程序。",
+  "description": "主人在任意聊天流下达一条短期叮嘱，作用于指定的另一个聊天流：以强/弱两档影响她的 planner，到期自动淡出。支持 /叮嘱 命令与自然语言工具，并可用群代号指代群。纯插件实现，不改主程序。",
   "author": {
     "name": "YeYe",
     "url": "https://github.com/42yoru"

@@ -6,6 +6,11 @@
 
 定位是"短期态度影响"，不是"实时制止"：下达时可以（默认）朝目标流投一次
 提醒，但说不说、说什么由目标流的 planner 自己决定。
+
+两条下达通道共用同一套落盘 / 投递 / 注入链路：
+- 命令 ``/叮嘱``（确定性，可兜底）；
+- 工具 ``owner_directive``（自然语言，由她自己的 planner 识别意图后调用）。
+群可以起代号（``owner_chat_alias`` 工具维护），下达时用代号指代。
 """
 
 from __future__ import annotations
@@ -16,19 +21,31 @@ from uuid import uuid4
 
 import time
 
-from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
-from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
+from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
+from .alias_store import AliasStore, AliasStoreError
 from .reminder_args import ACTION_LIST, ACTION_REVOKE, CommandRequest, is_revoke_all, parse_command
 from .reminder_store import Reminder, ReminderStage, ReminderStore, ReminderStoreError
 from .reminder_text import (
     INJECT_ITEM_ID_PREFIX,
+    OWNER_NOTE_ITEM_PREFIX,
+    build_alias_list_text,
+    build_alias_missing_text,
+    build_alias_removed_text,
+    build_alias_saved_text,
     build_created_receipt,
     build_error_text,
     build_injection_text,
     build_list_text,
+    build_missing_content_text,
     build_missing_reminder_text,
+    build_not_owner_text,
+    build_owner_alias_note,
     build_revoked_text,
+    build_tool_disabled_text,
+    build_unknown_alias_action_text,
+    build_unknown_alias_text,
     build_usage_text,
 )
 from .target_resolver import ResolvedTarget, TargetResolveError, resolve_group_target
@@ -36,6 +53,10 @@ from .target_resolver import ResolvedTarget, TargetResolveError, resolve_group_t
 DISPATCH_MODES = ("ask", "silent")
 
 CURRENT_STREAM_LABEL = "当前聊天流"
+
+ALIAS_ACTION_LIST = ("", "list", "ls", "列表", "查看")
+ALIAS_ACTION_SET = ("set", "add", "设置", "新增")
+ALIAS_ACTION_REMOVE = ("remove", "delete", "del", "删除")
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -46,7 +67,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.1.0", description="配置版本")
+    config_version: str = Field(default="0.2.0", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -130,6 +151,32 @@ class DispatchConfig(PluginConfigBase):
     )
 
 
+class ToolConfig(PluginConfigBase):
+    """自然语言工具配置。"""
+
+    __ui_label__ = "自然语言工具"
+    __ui_icon__ = "wrench"
+    __ui_order__ = 6
+
+    enabled: bool = Field(
+        default=True,
+        description="是否允许 owner_directive / owner_chat_alias 工具执行（关掉后工具仍在工具表里，但一律拒绝）",
+    )
+
+
+class AliasConfig(PluginConfigBase):
+    """群代号配置。"""
+
+    __ui_label__ = "群代号"
+    __ui_icon__ = "tags"
+    __ui_order__ = 7
+
+    inject_into_owner_chat: bool = Field(
+        default=True,
+        description="是否在主人私聊里注入群代号对照表（仅当已存在代号时注入；无代号时零改动）",
+    )
+
+
 class OwnerReminderConfig(PluginConfigBase):
     """主人的叮嘱插件配置模型。"""
 
@@ -139,6 +186,8 @@ class OwnerReminderConfig(PluginConfigBase):
     target: TargetConfig = Field(default_factory=TargetConfig)
     inject: InjectConfig = Field(default_factory=InjectConfig)
     dispatch: DispatchConfig = Field(default_factory=DispatchConfig)
+    tool: ToolConfig = Field(default_factory=ToolConfig)
+    alias: AliasConfig = Field(default_factory=AliasConfig)
 
 
 class OwnerReminderPlugin(MaiBotPlugin):
@@ -149,34 +198,66 @@ class OwnerReminderPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._store: Optional[ReminderStore] = None
+        self._alias_store: Optional[AliasStore] = None
+        self._owner_sessions: set[str] = set()
+
+    # ──── 组件声明 ────
+
+    def get_components(self) -> List[Dict[str, Any]]:
+        """收集组件，并把工具上的作用域声明提到顶层。
+
+        Runner 读取的是**顶层** `chat_scope`（`runner_main.py:1420`），而 SDK 的
+        `collect_components` 只对 ReplyExtension 做这个提升。所以 `@Tool(..., chat_scope="private")`
+        必须在这里补一次，否则会被当成 `all`——群聊里也会看到这两个工具。
+        """
+
+        components = super().get_components()
+        for component in components:
+            metadata = component.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            chat_scope = str(metadata.get("chat_scope") or "").strip()
+            if chat_scope and "chat_scope" not in component:
+                component["chat_scope"] = chat_scope
+            allowed_session = metadata.get("allowed_session")
+            if isinstance(allowed_session, list) and "allowed_session" not in component:
+                component["allowed_session"] = [
+                    str(item).strip() for item in allowed_session if str(item).strip()
+                ]
+        return components
 
     # ──── 生命周期 ────
 
     async def on_load(self) -> None:
-        """加载插件：准备状态存储。"""
+        """加载插件：准备状态存储，并尽力认领主人的私聊会话。"""
 
         self._store = self._build_store()
+        self._alias_store = AliasStore(self.ctx.paths.data_dir)
+        await self._refresh_owner_sessions()
         self.ctx.logger.info(
-            "主人的叮嘱已加载: 生效中=%s 条, 投递模式=%s, 主人=%s",
+            "主人的叮嘱已加载: 生效中=%s 条, 代号=%s 个, 主人的私聊=%s, 投递模式=%s",
             len(self._store.active_all(time.time())),
+            len(self._alias_store.all()),
+            sorted(self._owner_sessions),
             self.config.dispatch.mode,
-            self.config.owner.owners,
         )
 
     async def on_unload(self) -> None:
         """卸载插件：本插件无常驻任务，无需清理。"""
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
-        """配置热更新：重建状态存储，让 TTL、上限与档位比例立即生效。"""
+        """配置热更新：重建状态存储，让 TTL、上限、开关立即生效。"""
 
         del config_data
         if scope != "self":
             return
         self._store = self._build_store()
+        self._alias_store = AliasStore(self.ctx.paths.data_dir)
+        await self._refresh_owner_sessions()
         self.ctx.logger.info("主人的叮嘱配置已更新: version=%s", version)
 
     def _build_store(self) -> ReminderStore:
-        """按当前配置构造状态存储。"""
+        """按当前配置构造叮嘱状态存储。"""
 
         return ReminderStore(
             self.ctx.paths.data_dir,
@@ -186,11 +267,19 @@ class OwnerReminderPlugin(MaiBotPlugin):
 
     @property
     def store(self) -> ReminderStore:
-        """返回状态存储，未初始化时直接暴露问题。"""
+        """返回叮嘱状态存储，未初始化时直接暴露问题。"""
 
         if self._store is None:
             raise RuntimeError("叮嘱状态存储尚未初始化，on_load 未执行")
         return self._store
+
+    @property
+    def alias_store(self) -> AliasStore:
+        """返回群代号表，未初始化时直接暴露问题。"""
+
+        if self._alias_store is None:
+            raise RuntimeError("群代号表尚未初始化，on_load 未执行")
+        return self._alias_store
 
     # ──── 上下文注入 ────
 
@@ -204,7 +293,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def inject_owner_reminder(self, **kwargs: Any) -> Dict[str, Any]:
-        """在 planner 请求前追加叮嘱；没有生效叮嘱时一个字段都不改。"""
+        """在 planner 请求前追加叮嘱；没有任何要注入的内容时一个字段都不改。"""
 
         modified_kwargs = dict(kwargs)
         if not (self.config.plugin.enabled and self.config.inject.enabled):
@@ -216,20 +305,32 @@ class OwnerReminderPlugin(MaiBotPlugin):
             return {"action": "continue", "modified_kwargs": modified_kwargs}
 
         now = time.time()
-        active = self.store.active_for(session_id, now)
-        if not active:
-            # 无叮嘱 = 零改动：宿主只在 items 变化时才替换上下文，prompt 保持原样
+        strong_ratio = self.config.reminder.strong_ratio
+        appended: List[Dict[str, Any]] = [
+            self._build_system_item(reminder, reminder.stage(now, strong_ratio))
+            for reminder in self.store.active_for(session_id, now)
+        ]
+        owner_note = self._build_owner_note(session_id)
+        if owner_note is not None:
+            appended.append(owner_note)
+
+        if not appended:
+            # 没有要注入的内容 = 零改动：宿主只在 items 变化时才替换上下文，prompt 保持原样
             return {"action": "continue", "modified_kwargs": modified_kwargs}
 
-        strong_ratio = self.config.reminder.strong_ratio
-        appended = [self._build_system_item(reminder, reminder.stage(now, strong_ratio)) for reminder in active]
         # 只在末尾追加，绝不改动已有 item：已有部分的前缀 token 序列不变，前缀缓存不受影响
         modified_kwargs["items"] = [*items, *appended]
         self.ctx.logger.info("主人叮嘱已注入: session_id=%s 条数=%s", session_id, len(appended))
         return {"action": "continue", "modified_kwargs": modified_kwargs}
 
+    @classmethod
+    def _build_system_item(cls, reminder: Reminder, stage: ReminderStage) -> Dict[str, Any]:
+        """构造一条注入的 SystemMessageItem。"""
+
+        return cls._build_text_item(build_injection_text(reminder, stage), INJECT_ITEM_ID_PREFIX)
+
     @staticmethod
-    def _build_system_item(reminder: Reminder, stage: ReminderStage) -> Dict[str, Any]:
+    def _build_text_item(text: str, item_id_prefix: str) -> Dict[str, Any]:
         """构造宿主要求的 SystemMessageItem 快照。
 
         结构必须严格符合宿主反序列化规则，否则会被整条忽略：
@@ -240,12 +341,26 @@ class OwnerReminderPlugin(MaiBotPlugin):
         return {
             "item_type": "SystemMessageItem",
             "meta": {
-                "item_id": f"{INJECT_ITEM_ID_PREFIX}{reminder.id}_{uuid4().hex[:6]}",
+                "item_id": f"{item_id_prefix}{uuid4().hex[:10]}",
                 "logical_turn_id": None,
                 "timestamp": datetime.now().isoformat(),
             },
-            "parts": [{"type": "text", "text": build_injection_text(reminder, stage)}],
+            "parts": [{"type": "text", "text": text}],
         }
+
+    def _build_owner_note(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """在主人的私聊里补一条群代号对照 + 工具提示；不满足条件时返回 None。"""
+
+        if not (self.config.plugin.enabled and self.config.inject.enabled):
+            return None
+        if not (self.config.tool.enabled and self.config.alias.inject_into_owner_chat):
+            return None
+        if session_id not in self._owner_sessions:
+            return None
+        aliases = self.alias_store.all()
+        if not aliases:
+            return None
+        return self._build_text_item(build_owner_alias_note(aliases), OWNER_NOTE_ITEM_PREFIX)
 
     # ──── 命令 ────
 
@@ -260,7 +375,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         if not self.config.plugin.enabled:
             return False, None, True
 
-        context = self._command_context(kwargs)
+        context = self._invocation_context(kwargs)
         if not self._is_owner(context["platform"], context["user_id"]):
             self.ctx.logger.info(
                 "非主人使用叮嘱命令，已静默忽略: platform=%s user_id=%s",
@@ -270,7 +385,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
             return False, None, True
 
         rest = str((kwargs.get("matched_groups") or {}).get("rest") or "")
-        request = parse_command(rest)
+        request = parse_command(rest, is_alias=self._is_registered_alias)
 
         if request.action == ACTION_LIST:
             if not request.ok:
@@ -288,18 +403,13 @@ class OwnerReminderPlugin(MaiBotPlugin):
             await self._send(context["stream_id"], build_usage_text(request.error))
             return False, None, True
 
-        return await self._handle_set(
-            request,
-            context=context,
-            current_group_id=str(kwargs.get("group_id") or "").strip(),
-        )
+        return await self._handle_set(request, context=context)
 
     async def _handle_set(
         self,
         request: CommandRequest,
         *,
         context: Dict[str, str],
-        current_group_id: str,
     ) -> Tuple[bool, Optional[str], bool]:
         """下达一条叮嘱：解析目标、落盘、投递提醒并回执。"""
 
@@ -313,51 +423,26 @@ class OwnerReminderPlugin(MaiBotPlugin):
             )
             return False, None, True
 
-        target = await self._resolve_target(
+        self._remember_owner_session(context)
+        resolved = await self._resolve_target_with_alias(
             request.target_group_id,
             context=context,
-            current_group_id=current_group_id,
         )
-        if isinstance(target, str):
-            await self._send(context["stream_id"], build_error_text(target))
+        if isinstance(resolved, str):
+            await self._send(context["stream_id"], build_error_text(resolved))
             return False, None, True
 
-        max_content_chars = self.config.reminder.max_content_chars
-        truncated = len(request.content) > max_content_chars
-        content = request.content[:max_content_chars]
-
-        try:
-            reminder, evicted = self.store.create(
-                target_session_id=target.session_id,
-                target_label=target.label,
-                content=content,
-                issuer=f"{context['platform']}:{context['user_id']}",
-                source_session_id=context["stream_id"],
-                ttl_seconds=float(self.config.reminder.default_ttl_seconds),
-                now=time.time(),
-            )
-        except ReminderStoreError as exc:
-            self.ctx.logger.error("保存叮嘱失败: %s", exc)
-            await self._send(context["stream_id"], build_error_text(f"叮嘱没能保存：{exc}"))
-            return False, None, True
-
-        try:
-            dispatch_note = await self._dispatch_reminder(reminder, mode=mode)
-        except Exception as exc:  # 投递出错也要让主人知道叮嘱已经生效，别以为命令没成功
-            self.ctx.logger.error("朝目标流投递提醒异常: %s", exc, exc_info=True)
-            dispatch_note = f"⚠️ 但提醒投递出错（{exc}）：叮嘱已保存，会在目标流下次自然触发时生效。"
-
-        await self._send(
-            context["stream_id"],
-            build_created_receipt(
-                reminder,
-                ttl_seconds=self.config.reminder.default_ttl_seconds,
-                truncated=truncated,
-                evicted=evicted,
-                dispatch_note=dispatch_note,
-            ),
+        target, alias_name = resolved
+        reminder, receipt = await self._apply_directive(
+            content=request.content,
+            target=target,
+            alias_name=alias_name,
+            issuer=f"{context['platform']}:{context['user_id']}",
+            source_session_id=context["stream_id"],
+            mode=mode,
         )
-        return True, None, True
+        await self._send(context["stream_id"], receipt)
+        return reminder is not None, None, True
 
     async def _handle_list(self, context: Dict[str, str]) -> Tuple[bool, Optional[str], bool]:
         """查看生效中的叮嘱。"""
@@ -389,20 +474,197 @@ class OwnerReminderPlugin(MaiBotPlugin):
         await self._send(context["stream_id"], build_revoked_text(removed_one, ()))
         return True, None, True
 
+    # ──── 自然语言工具（只在私聊可见） ────
+
+    @Tool(
+        "owner_directive",
+        description=(
+            "当『主人』明确要求你去影响另一个聊天流的态度或话题时使用，"
+            "例如主人说『跟夜羊群的人说别再吵了』『去群里提一句早点睡』。"
+            "它只给那一侧的 planner 留下一层 10 分钟的短期态度影响，不是实时制止。"
+            "只有在主人本人要求时才调用；content 只写主人想传达的意思，不要搬运私聊原文。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="content",
+                param_type=ToolParamType.STRING,
+                description="要传达给那个聊天流的意思，写成对她的要求，例如『别继续和某人争执，语气放软』",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="chat",
+                param_type=ToolParamType.STRING,
+                description="目标聊天流：群号或已登记的群代号；留空表示当前聊天流",
+                required=False,
+            ),
+        ],
+        chat_scope="private",
+    )
+    async def handle_owner_directive(
+        self,
+        content: str = "",
+        chat: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """自然语言下达：由她自己的 planner 调用，落到与 ``/叮嘱`` 完全相同的链路。"""
+
+        context = self._invocation_context(kwargs)
+        if not self._is_owner(context["platform"], context["user_id"]):
+            self.ctx.logger.info(
+                "非主人调用 owner_directive，已拒绝: platform=%s user_id=%s",
+                context["platform"],
+                context["user_id"],
+            )
+            return {"success": False, "content": build_not_owner_text()}
+        self._remember_owner_session(context)
+
+        if not self.config.plugin.enabled or not self.config.tool.enabled:
+            return {"success": False, "content": build_tool_disabled_text()}
+
+        mode = self.config.dispatch.mode.strip().lower()
+        if mode not in DISPATCH_MODES:
+            return {
+                "success": False,
+                "content": f"插件配置 dispatch.mode 只支持 {' / '.join(DISPATCH_MODES)}，当前为 {self.config.dispatch.mode!r}",
+            }
+
+        normalized_content = str(content or "").strip()
+        if not normalized_content:
+            return {"success": False, "content": build_missing_content_text()}
+
+        resolved = await self._resolve_target_with_alias(chat, context=context)
+        if isinstance(resolved, str):
+            return {"success": False, "content": resolved}
+
+        target, alias_name = resolved
+        reminder, receipt = await self._apply_directive(
+            content=normalized_content,
+            target=target,
+            alias_name=alias_name,
+            issuer=f"{context['platform']}:{context['user_id']}",
+            source_session_id=context["stream_id"],
+            mode=mode,
+        )
+        return {"success": reminder is not None, "content": receipt}
+
+    @Tool(
+        "owner_chat_alias",
+        description=(
+            "维护『群代号』：主人给某个群起代号时使用，例如主人说『以后把 943355126 叫做夜羊群』。"
+            "action=set 新增或覆盖代号，action=remove 删除代号，action=list 查看现有代号。"
+            "只有主人本人可以操作。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="action",
+                param_type=ToolParamType.STRING,
+                description="set / remove / list",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="alias",
+                param_type=ToolParamType.STRING,
+                description="代号名称，set 与 remove 时必填",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="group",
+                param_type=ToolParamType.STRING,
+                description="群号，set 时必填",
+                required=False,
+            ),
+        ],
+        chat_scope="private",
+    )
+    async def handle_owner_chat_alias(
+        self,
+        action: str = "",
+        alias: str = "",
+        group: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """群代号的增删查。"""
+
+        context = self._invocation_context(kwargs)
+        if not self._is_owner(context["platform"], context["user_id"]):
+            self.ctx.logger.info(
+                "非主人调用 owner_chat_alias，已拒绝: platform=%s user_id=%s",
+                context["platform"],
+                context["user_id"],
+            )
+            return {"success": False, "content": build_not_owner_text()}
+        self._remember_owner_session(context)
+
+        if not self.config.plugin.enabled or not self.config.tool.enabled:
+            return {"success": False, "content": build_tool_disabled_text()}
+
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action in ALIAS_ACTION_LIST:
+            return {"success": True, "content": build_alias_list_text(self.alias_store.all())}
+        if normalized_action in ALIAS_ACTION_SET:
+            return await self._alias_set(alias=alias, group=group, context=context)
+        if normalized_action in ALIAS_ACTION_REMOVE:
+            return self._alias_remove(alias)
+        return {"success": False, "content": build_unknown_alias_action_text(action)}
+
+    async def _alias_set(self, *, alias: str, group: str, context: Dict[str, str]) -> Dict[str, Any]:
+        """登记一个群代号；会先确认这个群确实存在。"""
+
+        if not str(alias or "").strip() or not str(group or "").strip():
+            return {"success": False, "content": "设置代号需要同时给出代号名和群号。"}
+
+        platform = context["platform"] or self.config.target.platform
+        try:
+            target = await resolve_group_target(
+                self.ctx.chat,
+                platform=platform,
+                group_id=str(group).strip(),
+                account_id=self.config.target.account_id,
+            )
+        except TargetResolveError as exc:
+            return {"success": False, "content": f"没有把这个群记下来：{exc}"}
+
+        try:
+            saved = self.alias_store.set(
+                name=alias,
+                group_id=target.group_id,
+                platform=target.platform,
+                group_label=target.label,
+                now=time.time(),
+            )
+        except AliasStoreError as exc:
+            return {"success": False, "content": f"代号没保存：{exc}"}
+        return {"success": True, "content": build_alias_saved_text(saved)}
+
+    def _alias_remove(self, alias: str) -> Dict[str, Any]:
+        """删除一个群代号。"""
+
+        try:
+            removed = self.alias_store.remove(alias)
+        except AliasStoreError as exc:
+            return {"success": False, "content": f"代号没删除：{exc}"}
+        if removed is None:
+            return {
+                "success": False,
+                "content": build_alias_missing_text(str(alias or "").strip(), self.alias_store.all()),
+            }
+        return {"success": True, "content": build_alias_removed_text(removed)}
+
     # ──── 内部工具 ────
 
     @staticmethod
-    def _command_context(kwargs: Dict[str, Any]) -> Dict[str, str]:
-        """从命令调用参数里取出通用上下文。"""
+    def _invocation_context(kwargs: Dict[str, Any]) -> Dict[str, str]:
+        """从命令 / 工具调用参数里取出通用上下文。"""
 
         return {
             "stream_id": str(kwargs.get("stream_id") or "").strip(),
             "platform": str(kwargs.get("platform") or "").strip(),
             "user_id": str(kwargs.get("user_id") or "").strip(),
+            "group_id": str(kwargs.get("group_id") or "").strip(),
         }
 
     def _is_owner(self, platform: str, user_id: str) -> bool:
-        """判断下达者是否在主人白名单里。"""
+        """判断调用者是否在主人白名单里。"""
 
         if not platform or not user_id:
             return False
@@ -410,22 +672,84 @@ class OwnerReminderPlugin(MaiBotPlugin):
         allowed = {item.strip() for item in self.config.owner.owners if item.strip()}
         return identity in allowed
 
+    def _is_registered_alias(self, token: str) -> bool:
+        """判断一个 token 是否是已登记的群代号（供命令解析使用）。"""
+
+        return self.alias_store.find(token) is not None
+
+    def _remember_owner_session(self, context: Dict[str, str]) -> None:
+        """把主人的私聊会话记下来，供 hook 注入代号表使用。"""
+
+        if context["group_id"] or not context["stream_id"]:
+            return
+        if not self._is_owner(context["platform"], context["user_id"]):
+            return
+        self._owner_sessions.add(context["stream_id"])
+
+    async def _refresh_owner_sessions(self) -> None:
+        """按 owner 白名单尽力解析出主人的私聊会话 ID。"""
+
+        for owner in self.config.owner.owners:
+            platform, separator, user_id = owner.partition(":")
+            if not separator or not platform.strip() or not user_id.strip():
+                self.ctx.logger.warning("owner.owners 条目格式不正确，已跳过: %r", owner)
+                continue
+            streams = await self.ctx.chat.get_private_streams(platform.strip())
+            if not isinstance(streams, list):
+                self.ctx.logger.warning("读取私聊流返回异常，暂不注入代号表: %r", streams)
+                continue
+            for stream in streams:
+                if not isinstance(stream, dict):
+                    continue
+                if str(stream.get("user_id") or "").strip() != user_id.strip():
+                    continue
+                session_id = str(stream.get("session_id") or "").strip()
+                if session_id:
+                    self._owner_sessions.add(session_id)
+
+    async def _resolve_target_with_alias(
+        self,
+        token: str,
+        *,
+        context: Dict[str, str],
+    ) -> Union[Tuple[ResolvedTarget, str], str]:
+        """把 群号 / 代号 / 空 解析成目标聊天流。
+
+        Returns:
+            tuple[ResolvedTarget, str] | str: 成功时返回 (目标, 用到的代号)，失败时返回错误文本。
+        """
+
+        normalized_token = str(token or "").strip()
+        alias_name = ""
+        platform = context["platform"] or self.config.target.platform
+
+        if normalized_token and not (normalized_token.isascii() and normalized_token.isdigit()):
+            alias = self.alias_store.find(normalized_token)
+            if alias is None:
+                return build_unknown_alias_text(normalized_token, self.alias_store.all())
+            normalized_token = alias.group_id
+            platform = alias.platform or platform
+            alias_name = alias.name
+
+        target = await self._resolve_target(
+            normalized_token,
+            context=context,
+            platform=platform,
+        )
+        if isinstance(target, str):
+            return target
+        return target, alias_name
+
     async def _resolve_target(
         self,
         target_group_id: str,
         *,
         context: Dict[str, str],
-        current_group_id: str,
+        platform: str,
     ) -> Union[ResolvedTarget, str]:
-        """解析目标聊天流；失败时返回错误文本。
+        """解析目标聊天流；失败时返回错误文本。"""
 
-        Returns:
-            ResolvedTarget | str: 成功时返回目标，失败时返回给主人的错误文本。
-        """
-
-        platform = context["platform"] or self.config.target.platform
-        group_id = target_group_id or current_group_id
-
+        group_id = str(target_group_id or "").strip() or context["group_id"]
         if group_id:
             try:
                 return await resolve_group_target(
@@ -463,6 +787,53 @@ class OwnerReminderPlugin(MaiBotPlugin):
             name = str(stream.get("user_cardname") or stream.get("user_nickname") or "").strip()
             return f"{name}的私聊" if name else CURRENT_STREAM_LABEL
         return CURRENT_STREAM_LABEL
+
+    async def _apply_directive(
+        self,
+        *,
+        content: str,
+        target: ResolvedTarget,
+        alias_name: str,
+        issuer: str,
+        source_session_id: str,
+        mode: str,
+    ) -> Tuple[Optional[Reminder], str]:
+        """落盘 + 按 dispatch.mode 投递；返回 (提醒, 给用户或模型看的文本)。
+
+        命令与工具都走这里，保证两条通道的行为与落盘结构完全一致。
+        """
+
+        max_content_chars = self.config.reminder.max_content_chars
+        truncated = len(content) > max_content_chars
+        try:
+            reminder, evicted = self.store.create(
+                target_session_id=target.session_id,
+                target_label=target.label,
+                content=content[:max_content_chars],
+                issuer=issuer,
+                source_session_id=source_session_id,
+                ttl_seconds=float(self.config.reminder.default_ttl_seconds),
+                now=time.time(),
+            )
+        except ReminderStoreError as exc:
+            self.ctx.logger.error("保存叮嘱失败: %s", exc)
+            return None, build_error_text(f"叮嘱没能保存：{exc}")
+
+        try:
+            dispatch_note = await self._dispatch_reminder(reminder, mode=mode)
+        except Exception as exc:  # 投递出错也要让主人知道叮嘱已经生效，别以为命令没成功
+            self.ctx.logger.error("朝目标流投递提醒异常: %s", exc, exc_info=True)
+            dispatch_note = f"⚠️ 但提醒投递出错（{exc}）：叮嘱已保存，会在目标流下次自然触发时生效。"
+
+        receipt = build_created_receipt(
+            reminder,
+            ttl_seconds=self.config.reminder.default_ttl_seconds,
+            truncated=truncated,
+            evicted=evicted,
+            dispatch_note=dispatch_note,
+            alias_name=alias_name,
+        )
+        return reminder, receipt
 
     async def _dispatch_reminder(self, reminder: Reminder, *, mode: str) -> str:
         """按 ``dispatch.mode`` 决定是否朝目标流投一次提醒。

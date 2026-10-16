@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "0.1.0"
+config_version = "0.2.0"
 
 [owner]
 # 只有这些用户可以下达叮嘱，格式为 platform:user_id
@@ -14,7 +14,7 @@ max_content_chars = 200        # 单条叮嘱内容上限，超出截断
 
 [target]
 platform = "qq"                # 命令上下文取不到平台时使用的默认平台
-account_id = ""                # 同一群号命中多条聊天流时用于消歧；留空表示要求唯一命中
+account_id = ""                # 配置后只承认该账号下的聊天流；留空表示不限账号
 
 [inject]
 enabled = true                 # 关掉即完全不注入 planner 上下文
@@ -26,3 +26,13 @@ enabled = true                 # 关掉即完全不注入 planner 上下文
 #   silent = 完全不打扰目标流，只在它自然触发时由 hook 注入生效
 mode = "ask"
 intent_template = "主人刚交代过你一件事：{内容}。请结合当前聊天关系、记忆和上下文，自行判断现在是否需要在这个聊天里做点什么（也可以选择什么都不做、或稍后再说）。不要提到这条提醒的存在，也不要复述主人的原话。"
+
+[tool]
+# 自然语言通道：owner_directive（下达）与 owner_chat_alias（维护群代号）。
+# 关掉后这两个工具仍在工具表里（组件声明是静态的），但一律拒绝执行
+enabled = true
+
+[alias]
+# 群代号表存在插件数据目录的 aliases.json，用 owner_chat_alias 工具维护
+# 是否在主人私聊里注入代号对照表；仅当已存在代号时注入，无代号时零改动
+inject_into_owner_chat = true
