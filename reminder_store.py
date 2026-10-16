@@ -1,0 +1,274 @@
+"""主人的叮嘱：状态存储与时效衰减。
+
+本模块刻意不依赖插件上下文，只接受 data_dir 与策略参数，方便单元测试。
+状态文件损坏时直接抛错，不做静默兜底。
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+
+import json
+import os
+import uuid
+
+STORE_FILE_NAME = "reminders.json"
+STORE_VERSION = 1
+
+ReminderStage = Literal["strong", "weak", "expired"]
+
+
+class ReminderStoreError(RuntimeError):
+    """叮嘱状态文件缺失必要字段、损坏或不可读写。"""
+
+
+@dataclass(frozen=True)
+class Reminder:
+    """一条叮嘱。"""
+
+    id: str
+    target_session_id: str
+    target_label: str
+    content: str
+    issuer: str
+    source_session_id: str
+    created_at: float
+    ttl_seconds: float
+
+    def stage(self, now: float, strong_ratio: float) -> ReminderStage:
+        """按墙上时钟判断这条叮嘱当前处在哪一档。
+
+        Args:
+            now: 当前 Unix 时间戳。
+            strong_ratio: 强档占生效时长的比例。
+
+        Returns:
+            ReminderStage: ``strong`` / ``weak`` / ``expired``。
+        """
+
+        elapsed = now - self.created_at
+        if elapsed >= self.ttl_seconds:
+            return "expired"
+        if elapsed < self.ttl_seconds * strong_ratio:
+            return "strong"
+        return "weak"
+
+    def remaining_seconds(self, now: float) -> float:
+        """返回剩余生效秒数，最小为 0。"""
+
+        return max(0.0, self.ttl_seconds - (now - self.created_at))
+
+
+class ReminderStore:
+    """叮嘱状态文件；写入使用临时文件 + 原子替换，避免半份状态。"""
+
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        max_per_target: int,
+        strong_ratio: float,
+    ) -> None:
+        """初始化存储。
+
+        Args:
+            data_dir: 插件独立数据目录。
+            max_per_target: 同一目标流最多同时生效几条。
+            strong_ratio: 强档占生效时长的比例。
+        """
+
+        self._data_dir = Path(data_dir)
+        self._max_per_target = max_per_target
+        self._strong_ratio = strong_ratio
+        self._reminders: Optional[List[Reminder]] = None
+
+    @property
+    def path(self) -> Path:
+        """状态文件路径。"""
+
+        return self._data_dir / STORE_FILE_NAME
+
+    # ──── 读写 ────
+
+    def _ensure_loaded(self) -> List[Reminder]:
+        """惰性读取状态文件。"""
+
+        if self._reminders is None:
+            self._reminders = self._read_file()
+        return self._reminders
+
+    def _read_file(self) -> List[Reminder]:
+        """读取并严格校验状态文件。"""
+
+        if not self.path.exists():
+            return []
+        try:
+            raw_text = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ReminderStoreError(f"读取叮嘱状态文件失败: {self.path}: {exc}") from exc
+        try:
+            payload = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise ReminderStoreError(f"叮嘱状态文件不是合法 JSON: {self.path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ReminderStoreError(f"叮嘱状态文件顶层必须是对象: {self.path}")
+        if payload.get("version") != STORE_VERSION:
+            raise ReminderStoreError(
+                f"叮嘱状态文件版本不受支持: {payload.get('version')!r}（当前 {STORE_VERSION}）"
+            )
+        raw_reminders = payload.get("reminders")
+        if not isinstance(raw_reminders, list):
+            raise ReminderStoreError(f"叮嘱状态文件缺少 reminders 列表: {self.path}")
+        return [self._decode_reminder(item) for item in raw_reminders]
+
+    @staticmethod
+    def _decode_reminder(raw: Any) -> Reminder:
+        """把一条 JSON 记录还原成 Reminder。"""
+
+        if not isinstance(raw, dict):
+            raise ReminderStoreError(f"叮嘱条目必须是对象: {raw!r}")
+        for key in ("id", "target_session_id", "content", "issuer", "source_session_id"):
+            value = raw.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ReminderStoreError(f"叮嘱条目缺少非空字符串字段 {key}: {raw!r}")
+        try:
+            created_at = float(raw["created_at"])
+            ttl_seconds = float(raw["ttl_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReminderStoreError(f"叮嘱条目时间字段不合法: {raw!r}") from exc
+        return Reminder(
+            id=raw["id"].strip(),
+            target_session_id=raw["target_session_id"].strip(),
+            target_label=str(raw.get("target_label") or "").strip(),
+            content=raw["content"],
+            issuer=raw["issuer"].strip(),
+            source_session_id=raw["source_session_id"].strip(),
+            created_at=created_at,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def _write_file(self, reminders: List[Reminder]) -> None:
+        """原子写入状态文件。"""
+
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "version": STORE_VERSION,
+            "reminders": [asdict(item) for item in reminders],
+        }
+        temp_path = self.path.parent / (self.path.name + ".tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, self.path)
+        except OSError as exc:
+            raise ReminderStoreError(f"写入叮嘱状态文件失败: {self.path}: {exc}") from exc
+
+    # ──── 查询 ────
+
+    def active_for(self, session_id: str, now: float) -> List[Reminder]:
+        """返回某个聊天流当前生效的叮嘱，按创建时间升序。"""
+
+        self.purge_expired(now)
+        return sorted(
+            [item for item in self._ensure_loaded() if item.target_session_id == session_id],
+            key=lambda item: item.created_at,
+        )
+
+    def active_all(self, now: float) -> List[Reminder]:
+        """返回全部生效中的叮嘱，按创建时间升序。"""
+
+        self.purge_expired(now)
+        return sorted(self._ensure_loaded(), key=lambda item: item.created_at)
+
+    def purge_expired(self, now: float) -> List[Reminder]:
+        """清除已到期条目，返回被清除的条目。"""
+
+        reminders = self._ensure_loaded()
+        expired = [item for item in reminders if item.stage(now, self._strong_ratio) == "expired"]
+        if expired:
+            expired_ids = {item.id for item in expired}
+            self._reminders = [item for item in reminders if item.id not in expired_ids]
+            self._write_file(self._reminders)
+        return expired
+
+    # ──── 写入 ────
+
+    def create(
+        self,
+        *,
+        target_session_id: str,
+        target_label: str,
+        content: str,
+        issuer: str,
+        source_session_id: str,
+        ttl_seconds: float,
+        now: float,
+    ) -> Tuple[Reminder, List[Reminder]]:
+        """新增一条叮嘱。
+
+        Returns:
+            Tuple[Reminder, List[Reminder]]: 新叮嘱，以及因为超出同目标上限而被替换掉的旧叮嘱。
+        """
+
+        self.purge_expired(now)
+        reminders = self._ensure_loaded()
+        reminder = Reminder(
+            id=self._new_id({item.id for item in reminders}),
+            target_session_id=target_session_id,
+            target_label=target_label,
+            content=content,
+            issuer=issuer,
+            source_session_id=source_session_id,
+            created_at=now,
+            ttl_seconds=float(ttl_seconds),
+        )
+
+        # 同一目标流超过上限时，按最旧替换，避免 prompt 里堆积过期态度
+        same_target = sorted(
+            (item for item in reminders if item.target_session_id == target_session_id),
+            key=lambda item: item.created_at,
+        )
+        overflow = max(0, len(same_target) - self._max_per_target + 1)
+        evicted = same_target[:overflow]
+        evicted_ids = {item.id for item in evicted}
+
+        self._reminders = [item for item in reminders if item.id not in evicted_ids]
+        self._reminders.append(reminder)
+        self._write_file(self._reminders)
+        return reminder, evicted
+
+    def revoke(self, reminder_id: str, now: float) -> Optional[Reminder]:
+        """按编号撤销一条叮嘱；找不到时返回 None。"""
+
+        self.purge_expired(now)
+        normalized_id = str(reminder_id or "").strip().lstrip("#").lower()
+        for item in self._ensure_loaded():
+            if item.id != normalized_id:
+                continue
+            self._reminders = [candidate for candidate in self._ensure_loaded() if candidate.id != item.id]
+            self._write_file(self._reminders)
+            return item
+        return None
+
+    def revoke_all(self, now: float) -> List[Reminder]:
+        """撤销全部生效中的叮嘱，返回被撤销的条目。"""
+
+        self.purge_expired(now)
+        removed = list(self._ensure_loaded())
+        if removed:
+            self._reminders = []
+            self._write_file(self._reminders)
+        return removed
+
+    @staticmethod
+    def _new_id(existing_ids: Set[str]) -> str:
+        """生成一个不与现有条目冲突的短编号。"""
+
+        while True:
+            candidate = uuid.uuid4().hex[:4]
+            if candidate not in existing_ids:
+                return candidate

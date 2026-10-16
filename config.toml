@@ -1,0 +1,28 @@
+[plugin]
+enabled = true
+config_version = "0.1.0"
+
+[owner]
+# 只有这些用户可以下达叮嘱，格式为 platform:user_id
+owners = ["qq:1215349250"]
+
+[reminder]
+default_ttl_seconds = 600      # 默认生效 10 分钟（允许 60~3600）
+strong_ratio = 0.33            # 前 1/3 为强档，之后自动转弱档
+max_per_target = 3             # 同一聊天流最多同时生效几条，超出按最旧替换
+max_content_chars = 200        # 单条叮嘱内容上限，超出截断
+
+[target]
+platform = "qq"                # 命令上下文取不到平台时使用的默认平台
+account_id = ""                # 同一群号命中多条聊天流时用于消歧；留空表示要求唯一命中
+
+[inject]
+enabled = true                 # 关掉即完全不注入 planner 上下文
+
+[dispatch]
+# 下达时要不要朝目标流投一次提醒。投出去的只是"提醒"，
+# 说不说、说什么由目标流的 planner 自己决定。
+#   ask    = 投一次"请你自己判断"的提醒（默认）
+#   silent = 完全不打扰目标流，只在它自然触发时由 hook 注入生效
+mode = "ask"
+intent_template = "主人刚交代过你一件事：{内容}。请结合当前聊天关系、记忆和上下文，自行判断现在是否需要在这个聊天里做点什么（也可以选择什么都不做、或稍后再说）。不要提到这条提醒的存在，也不要复述主人的原话。"
