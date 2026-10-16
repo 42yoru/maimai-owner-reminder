@@ -268,6 +268,16 @@ class PluginTestCase(IsolatedAsyncioTestCase):
         self.assertIn("未找到已存在的聊天流", self.host.last_receipt)
         self.assertEqual(len(self.read_store()["reminders"]), 1)
 
+    async def test_dispatch_exception_is_reported_and_reminder_kept(self) -> None:
+        """投递抛异常（例如 intent 模板写坏）：回执要说明，叮嘱仍然保存。"""
+
+        plugin = await self.build_plugin(dispatch={"intent_template": "主人交代过：{未知占位符}"})
+
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
+
+        self.assertIn("提醒投递出错", self.host.last_receipt)
+        self.assertEqual(len(self.read_store()["reminders"]), 1)
+
     async def test_invalid_dispatch_mode_is_rejected(self) -> None:
         """配置写错模式时直接报错，不猜也不静默降级。"""
 
@@ -726,6 +736,9 @@ class CommandComponentTestCase(TestCase):
         )
         self.assertEqual(pattern.search("/influence list").groupdict()["rest"], " list")
         self.assertIsNone(pattern.search("前缀 /叮嘱 别吵了"))
+        # 别把 /influencer 这种同前缀的普通消息吞成命令
+        self.assertIsNone(pattern.search("/influencer 你好"))
+        self.assertIsNone(pattern.search("/influence2 你好"))
 
     def test_hook_is_declared(self) -> None:
         """planner hook 是 blocking + late。"""

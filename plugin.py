@@ -252,7 +252,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
     @Command(
         "owner_reminder",
         description="主人的叮嘱：下达 / 查看 / 撤销作用于指定聊天流的短期叮嘱",
-        pattern=r"(?s)^/(?:叮嘱|influence)(?P<rest>.*)$",
+        pattern=r"(?s)^/(?:叮嘱|influence)(?![0-9A-Za-z_])(?P<rest>.*)$",
     )
     async def handle_owner_reminder(self, **kwargs: Any) -> Tuple[bool, Optional[str], bool]:
         """处理 ``/叮嘱``、``/叮嘱列表``、``/叮嘱撤销`` 三种形态。"""
@@ -341,7 +341,12 @@ class OwnerReminderPlugin(MaiBotPlugin):
             await self._send(context["stream_id"], build_error_text(f"叮嘱没能保存：{exc}"))
             return False, None, True
 
-        dispatch_note = await self._dispatch_reminder(reminder, mode=mode)
+        try:
+            dispatch_note = await self._dispatch_reminder(reminder, mode=mode)
+        except Exception as exc:  # 投递出错也要让主人知道叮嘱已经生效，别以为命令没成功
+            self.ctx.logger.error("朝目标流投递提醒异常: %s", exc, exc_info=True)
+            dispatch_note = f"⚠️ 但提醒投递出错（{exc}）：叮嘱已保存，会在目标流下次自然触发时生效。"
+
         await self._send(
             context["stream_id"],
             build_created_receipt(
@@ -490,7 +495,8 @@ class OwnerReminderPlugin(MaiBotPlugin):
     async def _send(self, stream_id: str, text: str) -> None:
         """发送回执。
 
-        回执是给主人的界面反馈，不写进 Maisaka 上下文，避免污染她的对话历史。
+        回执是给主人的界面反馈：宿主默认 `sync_to_maisaka_history=False`，所以它**不进**
+        她的 planner 上下文（但默认 `storage_message=True`，会入库并在聊天记录里可见）。
         """
 
         if not stream_id:
