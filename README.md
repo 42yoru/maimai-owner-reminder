@@ -123,10 +123,16 @@
 
 ## 配置（`config.toml`）
 
+仓库里的 `config.toml` 是**通用版**：结构完整、注释齐全，只有 `[owner] owners` 是空的。
+宿主不会改写它（内容和配置模型完全一致），装上后把 `owners` 填成你自己的账号即可；
+就算删掉这份文件，宿主也会按配置模型自动生成一份（只是没有注释）。
+
+`owners` 为空时插件能正常加载，但**没有人能下达叮嘱**，启动日志里会有一条 warning 提示你填：
+
 ```toml
 [plugin]
 enabled = true
-config_version = "0.3.0"
+config_version = "0.3.1"
 
 [owner]
 owners = ["qq:123456789"]      # platform:user_id，换成你自己的账号；留空表示谁都不能下达
@@ -187,7 +193,7 @@ inject_into_owner_chat = true  # 是否在主人私聊里注入代号对照表
 python -m unittest discover -s tests -v
 ```
 
-141 项测试，覆盖：无内容时"零改动"、注入项结构与 schema 回传、TTL 分档边界、
+143 项测试，覆盖：无内容时"零改动"、注入项结构与 schema 回传、TTL 分档边界、
 目标解析失败与多命中消歧、账号不匹配报错、`ask` / `silent` 分支、非主人静默忽略、
 列表/撤销、同目标超上限替换、状态文件损坏与缺字段时报错、`config.toml` 与配置模型一致性、
 两个工具的权限与分支、代号的增删查与合法性校验、代号在命令与工具两侧的解析、
@@ -196,7 +202,7 @@ python -m unittest discover -s tests -v
 
 ## 验证状态
 
-**单元测试**：`python -m unittest discover -s tests` → 141 项全绿（stdlib `unittest`，无额外依赖）。
+**单元测试**：`python -m unittest discover -s tests` → 143 项全绿（stdlib `unittest`，无额外依赖）。
 
 **真机验证（MaiBot 1.3.9 / 1.3.12）**
 

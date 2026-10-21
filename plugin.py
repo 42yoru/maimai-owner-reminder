@@ -67,7 +67,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.3.0", description="配置版本")
+    config_version: str = Field(default="0.3.1", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -251,6 +251,22 @@ class OwnerReminderPlugin(MaiBotPlugin):
             self.config.dispatch.mode,
             self._bot_nickname or "(未知)",
         )
+        self._warn_if_no_owner()
+
+    def _configured_owners(self) -> List[str]:
+        """返回归一化后的主人白名单（去掉空白项）。"""
+
+        return [item.strip() for item in self.config.owner.owners if item.strip()]
+
+    def _warn_if_no_owner(self) -> None:
+        """主人白名单为空时给一条明确提示，免得用户以为插件没装上。"""
+
+        if self._configured_owners():
+            return
+        self.ctx.logger.warning(
+            "owner.owners 为空：还没有任何人可以下达叮嘱。"
+            "请在 config.toml 的 [owner] 里填上 platform:user_id（例如 qq:123456789），保存后立即生效。"
+        )
 
     async def on_unload(self) -> None:
         """卸载插件：本插件无常驻任务，无需清理。"""
@@ -266,6 +282,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         await self._refresh_owner_sessions()
         await self._refresh_bot_nickname()
         self.ctx.logger.info("主人的叮嘱配置已更新: version=%s", version)
+        self._warn_if_no_owner()
 
     def _build_store(self) -> ReminderStore:
         """按当前配置构造叮嘱状态存储。"""

@@ -29,6 +29,7 @@ _MANIFEST = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8
 # 模块名与插件 id 都不写死：一个取目录名，一个取 manifest
 MODULE_NAME = PLUGIN_DIR.name
 PLUGIN_ID = _MANIFEST["id"]
+MANIFEST_VERSION = _MANIFEST["version"]
 
 PLATFORM = "qq"
 OWNER_ID = "100000001"
@@ -1549,6 +1550,23 @@ class AliasAndToolTestCase(PluginTestCase):
 
         self.assertEqual(result["modified_kwargs"]["items"], items)
 
+    async def test_empty_owner_list_is_reported(self) -> None:
+        """主人白名单为空时要在启动日志里说清楚，别让人以为插件坏了。"""
+
+        plugin = await self.build_plugin(owner={"owners": []})
+
+        with self.assertLogs(plugin.ctx.logger, level="WARNING") as captured:
+            plugin._warn_if_no_owner()
+
+        self.assertIn("owner.owners 为空", "\n".join(captured.output))
+
+    async def test_configured_owner_is_not_reported(self) -> None:
+        """配好主人时不该有这条告警。"""
+
+        plugin = await self.build_plugin()
+
+        self.assertEqual(plugin._configured_owners(), [OWNER])
+
     async def test_owner_session_learned_from_tool_call(self) -> None:
         """加载时解析不到主人私聊也没关系：调用一次工具就自我补全。"""
 
@@ -1667,7 +1685,7 @@ class ConfigFileTestCase(TestCase):
 
         self.assertFalse(changed, f"config.toml 与配置模型不一致: {normalized}")
         self.assertTrue(normalized["plugin"]["enabled"])
-        self.assertEqual(normalized["plugin"]["config_version"], "0.3.0")
+        self.assertEqual(normalized["plugin"]["config_version"], MANIFEST_VERSION)
         self.assertIsInstance(normalized["owner"]["owners"], list)
         self.assertEqual(normalized["reminder"]["default_ttl_seconds"], 600)
         self.assertEqual(normalized["reminder"]["strong_ratio"], 0.33)
