@@ -34,7 +34,7 @@ PLATFORM = "qq"
 OWNER_ID = "100000001"
 OWNER = f"{PLATFORM}:{OWNER_ID}"
 NON_OWNER_ID = "99999999"
-GROUP_ID = "943355126"
+GROUP_ID = "123456789"
 GROUP_NAME = "测试群"
 TARGET_SESSION = "1111222233334444aaaabbbbccccdddd"
 ISSUER_SESSION = "aaaabbbbccccdddd1111222233334444"
@@ -816,7 +816,7 @@ class CommandComponentTestCase(TestCase):
         pattern = re.compile(self.components[COMMAND_NAME]["metadata"]["command_pattern"])
         self.assertEqual(pattern.search("/叮嘱").groupdict()["rest"], "")
         self.assertEqual(
-            pattern.search("/叮嘱 943355126 别吵了").groupdict()["rest"], " 943355126 别吵了"
+            pattern.search("/叮嘱 123456789 别吵了").groupdict()["rest"], " 123456789 别吵了"
         )
         self.assertEqual(pattern.search("/influence list").groupdict()["rest"], " list")
         self.assertIsNone(pattern.search("前缀 /叮嘱 别吵了"))
@@ -870,10 +870,10 @@ class ArgumentParseTestCase(TestCase):
     """命令参数解析。"""
 
     def test_set_with_group_id(self) -> None:
-        parsed = ARGS_MODULE.parse_command("943355126 别吵了")
+        parsed = ARGS_MODULE.parse_command("123456789 别吵了")
         self.assertTrue(parsed.ok)
         self.assertEqual(parsed.action, ARGS_MODULE.ACTION_SET)
-        self.assertEqual(parsed.target_group_id, "943355126")
+        self.assertEqual(parsed.target_group_id, "123456789")
         self.assertEqual(parsed.content, "别吵了")
 
     def test_set_with_here(self) -> None:
@@ -889,7 +889,7 @@ class ArgumentParseTestCase(TestCase):
         self.assertEqual(parsed.content, "别跟那个人吵了")
 
     def test_set_keeps_multiline_content(self) -> None:
-        parsed = ARGS_MODULE.parse_command("943355126 第一行\n第二行")
+        parsed = ARGS_MODULE.parse_command("123456789 第一行\n第二行")
         self.assertTrue(parsed.ok)
         self.assertEqual(parsed.content, "第一行\n第二行")
 
@@ -924,7 +924,7 @@ class ArgumentParseTestCase(TestCase):
     def test_error_cases(self) -> None:
         self.assertFalse(ARGS_MODULE.parse_command("").ok)
         self.assertFalse(ARGS_MODULE.parse_command("@here").ok)
-        self.assertFalse(ARGS_MODULE.parse_command("943355126").ok)
+        self.assertFalse(ARGS_MODULE.parse_command("123456789").ok)
 
     def test_revoke_all_markers(self) -> None:
         self.assertTrue(ARGS_MODULE.is_revoke_all("all"))
@@ -1267,7 +1267,7 @@ class AliasAndToolTestCase(PluginTestCase):
             },
             {
                 "session_id": DUPLICATE_SESSION,
-                "group_id": "982628545",
+                "group_id": "987654321",
                 "group_name": "另一个群",
                 "account_id": "10001",
                 "platform": PLATFORM,
@@ -1279,12 +1279,12 @@ class AliasAndToolTestCase(PluginTestCase):
             action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
         await plugin.handle_owner_chat_alias(
-            action="set", alias="技术群", group="982628545", **self.tool_kwargs()
+            action="set", alias="技术群", group="987654321", **self.tool_kwargs()
         )
 
         aliases = self.read_aliases()["aliases"]
         self.assertEqual(len(aliases), 1)
-        self.assertEqual(aliases[0]["group_id"], "982628545")
+        self.assertEqual(aliases[0]["group_id"], "987654321")
 
     async def test_alias_unknown_action(self) -> None:
         """不认识的 action 要明确报错。"""

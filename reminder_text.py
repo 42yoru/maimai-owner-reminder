@@ -166,7 +166,7 @@ def build_alias_list_text(aliases: Sequence[ChatAlias]) -> str:
     """生成代号表文本。"""
 
     if not aliases:
-        return "📇 还没有设置任何群代号。可以说「把 943355126 叫做技术群」来加一个。"
+        return "📇 还没有设置任何群代号。可以说「把 123456789 叫做技术群」来加一个。"
     lines = [f"📇 群代号（{len(aliases)} 个）"]
     for item in aliases:
         label = f"（{item.group_label}）" if item.group_label else ""

@@ -607,7 +607,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
     @Tool(
         "owner_chat_alias",
         description=(
-            "维护『群代号』：主人给某个群起代号时使用，例如主人说『以后把 943355126 叫做技术群』。"
+            "维护『群代号』：主人给某个群起代号时使用，例如主人说『以后把 123456789 叫做技术群』。"
             "action=set 新增或覆盖代号，action=remove 删除代号，action=list 查看现有代号。"
             "只有主人本人可以操作。"
         ),
