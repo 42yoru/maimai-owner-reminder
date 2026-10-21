@@ -166,7 +166,7 @@ def build_alias_list_text(aliases: Sequence[ChatAlias]) -> str:
     """生成代号表文本。"""
 
     if not aliases:
-        return "📇 还没有设置任何群代号。可以说「把 943355126 叫做夜羊群」来加一个。"
+        return "📇 还没有设置任何群代号。可以说「把 943355126 叫做技术群」来加一个。"
     lines = [f"📇 群代号（{len(aliases)} 个）"]
     for item in aliases:
         label = f"（{item.group_label}）" if item.group_label else ""
@@ -209,11 +209,18 @@ def build_unknown_alias_action_text(action: str) -> str:
     return f"不认识的 action「{action}」：只支持 set / remove / list。"
 
 
-def build_owner_alias_note(aliases: Sequence[ChatAlias]) -> str:
-    """生成注入到主人私聊里的代号对照 + 工具提示。"""
+def build_owner_alias_note(aliases: Sequence[ChatAlias], *, bot_name: str = "") -> str:
+    """生成注入到主人私聊里的代号对照 + 工具提示。
 
+    Args:
+        aliases: 当前群代号表。
+        bot_name: bot 昵称，从宿主配置读取；为空时退回中性的「你」。
+    """
+
+    subject = bot_name or "你"
     return (
-        "【主人私聊·跨聊天流影响】主人要你影响别的聊天流时，用 owner_directive 工具，"
+        "【主人私聊·跨聊天流影响】主人要让"
+        f"{subject}影响别的聊天流时，用 owner_directive 工具，"
         "chat 填群号或下面这些代号（留空表示当前聊天流）。\n"
         f"群代号：{format_alias_table(aliases)}"
     )

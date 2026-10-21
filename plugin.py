@@ -67,7 +67,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.2.0", description="配置版本")
+    config_version: str = Field(default="0.3.0", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -78,8 +78,8 @@ class OwnerConfig(PluginConfigBase):
     __ui_order__ = 1
 
     owners: List[str] = Field(
-        default_factory=lambda: ["qq:1215349250"],
-        description="只有这些用户可以下达叮嘱，格式为 platform:user_id，例如 qq:123456789",
+        default_factory=list,
+        description="只有这些用户可以下达叮嘱，格式为 platform:user_id，例如 qq:123456789；留空表示谁都不能下达",
     )
 
 
@@ -104,6 +104,13 @@ class ReminderConfig(PluginConfigBase):
         description="同一聊天流最多同时生效几条叮嘱，超出时按最旧替换",
     )
     max_content_chars: int = Field(default=200, ge=1, le=1000, description="单条叮嘱内容的最大字符数")
+    consume_on_reply: bool = Field(
+        default=True,
+        description=(
+            "投递过提醒的叮嘱，在她于目标流发出第一条可见回复后立即消费掉（不再等 TTL）；"
+            "关掉则回到纯 TTL 行为。silent 模式没有投递，不受此项影响"
+        ),
+    )
 
 
 class TargetConfig(PluginConfigBase):
@@ -200,6 +207,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         self._store: Optional[ReminderStore] = None
         self._alias_store: Optional[AliasStore] = None
         self._owner_sessions: set[str] = set()
+        self._bot_nickname: str = ""
 
     # ──── 组件声明 ────
 
@@ -234,12 +242,14 @@ class OwnerReminderPlugin(MaiBotPlugin):
         self._store = self._build_store()
         self._alias_store = AliasStore(self.ctx.paths.data_dir)
         await self._refresh_owner_sessions()
+        await self._refresh_bot_nickname()
         self.ctx.logger.info(
-            "主人的叮嘱已加载: 生效中=%s 条, 代号=%s 个, 主人的私聊=%s, 投递模式=%s",
+            "主人的叮嘱已加载: 生效中=%s 条, 代号=%s 个, 主人的私聊=%s, 投递模式=%s, 昵称=%s",
             len(self._store.active_all(time.time())),
             len(self._alias_store.all()),
             sorted(self._owner_sessions),
             self.config.dispatch.mode,
+            self._bot_nickname or "(未知)",
         )
 
     async def on_unload(self) -> None:
@@ -254,6 +264,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         self._store = self._build_store()
         self._alias_store = AliasStore(self.ctx.paths.data_dir)
         await self._refresh_owner_sessions()
+        await self._refresh_bot_nickname()
         self.ctx.logger.info("主人的叮嘱配置已更新: version=%s", version)
 
     def _build_store(self) -> ReminderStore:
@@ -323,6 +334,49 @@ class OwnerReminderPlugin(MaiBotPlugin):
         self.ctx.logger.info("主人叮嘱已注入: session_id=%s 条数=%s", session_id, len(appended))
         return {"action": "continue", "modified_kwargs": modified_kwargs}
 
+    # ──── 兑现即消费 ────
+
+    @HookHandler(
+        "maisaka.reply.before_post_process",
+        name="owner_reminder_consume",
+        description="目标流即将发出可见回复时，消费掉已经投递过提醒的叮嘱。",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=3000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def consume_after_reply(self, **kwargs: Any) -> Dict[str, Any]:
+        """她真的在目标流说话了，这条叮嘱的作用已经兑现，立即撤掉。
+
+        消费点必须落在"可见回复即将发出"这一刻，不能落在"投递"上：
+        ``ask`` 只是入队唤醒，叮嘱注入发生在 planner 请求**之前**，
+        投递完就删等于让那一轮 planner 看不到叮嘱——白投。
+
+        不修改任何 kwargs，只做旁路清理。
+        """
+
+        if not (self.config.plugin.enabled and self.config.reminder.consume_on_reply):
+            return {"action": "continue"}
+
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not session_id:
+            return {"action": "continue"}
+
+        try:
+            consumed = self.store.consume_dispatched(session_id)
+        except ReminderStoreError as exc:
+            # 状态文件出问题时宁可不消费，也不能让一次回复因此失败
+            self.ctx.logger.error("消费叮嘱失败: %s", exc)
+            return {"action": "continue"}
+
+        if consumed:
+            self.ctx.logger.info(
+                "叮嘱已兑现并消费: session_id=%s ids=%s",
+                session_id,
+                [item.id for item in consumed],
+            )
+        return {"action": "continue"}
+
     @classmethod
     def _build_system_item(cls, reminder: Reminder, stage: ReminderStage) -> Dict[str, Any]:
         """构造一条注入的 SystemMessageItem。"""
@@ -360,7 +414,10 @@ class OwnerReminderPlugin(MaiBotPlugin):
         aliases = self.alias_store.all()
         if not aliases:
             return None
-        return self._build_text_item(build_owner_alias_note(aliases), OWNER_NOTE_ITEM_PREFIX)
+        return self._build_text_item(
+            build_owner_alias_note(aliases, bot_name=self._bot_nickname),
+            OWNER_NOTE_ITEM_PREFIX,
+        )
 
     # ──── 命令 ────
 
@@ -480,7 +537,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         "owner_directive",
         description=(
             "当『主人』明确要求你去影响另一个聊天流的态度或话题时使用，"
-            "例如主人说『跟夜羊群的人说别再吵了』『去群里提一句早点睡』。"
+            "例如主人说『跟技术群的人说别再吵了』『去群里提一句早点睡』。"
             "它只给那一侧的 planner 留下一层 10 分钟的短期态度影响，不是实时制止。"
             "只有在主人本人要求时才调用；content 只写主人想传达的意思，不要搬运私聊原文。"
         ),
@@ -550,7 +607,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
     @Tool(
         "owner_chat_alias",
         description=(
-            "维护『群代号』：主人给某个群起代号时使用，例如主人说『以后把 943355126 叫做夜羊群』。"
+            "维护『群代号』：主人给某个群起代号时使用，例如主人说『以后把 943355126 叫做技术群』。"
             "action=set 新增或覆盖代号，action=remove 删除代号，action=list 查看现有代号。"
             "只有主人本人可以操作。"
         ),
@@ -685,6 +742,21 @@ class OwnerReminderPlugin(MaiBotPlugin):
         if not self._is_owner(context["platform"], context["user_id"]):
             return
         self._owner_sessions.add(context["stream_id"])
+
+    async def _refresh_bot_nickname(self) -> None:
+        """从宿主配置读 bot 昵称，避免把某个具体的名字写死在插件里。
+
+        读不到就保持空串，调用方会退回中性的「你」，不影响任何功能。
+        """
+
+        try:
+            # SDK 会把 config.get 的返回值拆包：拿到的是配置值本身，不是 {"success": ..., "value": ...}
+            value = await self.ctx.call_capability("config.get", key="bot.nickname", default="")
+        except Exception as exc:  # noqa: BLE001 - 昵称只影响文案，读不到不该让加载失败
+            self.ctx.logger.warning("读取 bot 昵称失败: %s", exc)
+            self._bot_nickname = ""
+            return
+        self._bot_nickname = value.strip() if isinstance(value, str) else ""
 
     async def _refresh_owner_sessions(self) -> None:
         """按 owner 白名单尽力解析出主人的私聊会话 ID。"""
@@ -861,6 +933,8 @@ class OwnerReminderPlugin(MaiBotPlugin):
             reminder.target_session_id,
             result.get("task_id"),
         )
+        # 记下"投递过"：之后她一旦在这个目标流真的开口，这条叮嘱就该被消费掉
+        self.store.mark_dispatched(reminder.id, time.time())
         return "已提醒她自己去判断要不要现在处理。"
 
     async def _send(self, stream_id: str, text: str) -> None:

@@ -25,20 +25,26 @@ from maibot_sdk import PluginContext, PluginPaths
 from maibot_sdk.types import ComponentType
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
-MODULE_NAME = "yeye_owner_reminder"
+_MANIFEST = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
+# 模块名与插件 id 都不写死：一个取目录名，一个取 manifest
+MODULE_NAME = PLUGIN_DIR.name
+PLUGIN_ID = _MANIFEST["id"]
 
 PLATFORM = "qq"
-OWNER_ID = "1215349250"
+OWNER_ID = "100000001"
 OWNER = f"{PLATFORM}:{OWNER_ID}"
 NON_OWNER_ID = "99999999"
 GROUP_ID = "943355126"
-GROUP_NAME = "全是熟人社会，夜羊烂完了"
-TARGET_SESSION = "ad234af79b55716264cd386a4770b805"
-ISSUER_SESSION = "3695a82e4db39ede9f14040523ab13b4"
-OTHER_ACCOUNT = "3350829885"
-DUPLICATE_SESSION = "be4a61f2a0928bd3d392ccf8d36f2d26"
+GROUP_NAME = "测试群"
+TARGET_SESSION = "1111222233334444aaaabbbbccccdddd"
+ISSUER_SESSION = "aaaabbbbccccdddd1111222233334444"
+OTHER_ACCOUNT = "100000002"
+DUPLICATE_SESSION = "5555666677778888eeeeffff00001111"
 
 COMMAND_NAME = "owner_reminder"
+
+# bot 昵称由宿主配置提供，插件不写死；测试里给一个与真实实例无关的名字
+BOT_NICKNAME = "小助手"
 
 
 def _load_plugin_module() -> Any:
@@ -82,7 +88,7 @@ class FakeHost:
             {
                 "session_id": ISSUER_SESSION,
                 "user_id": OWNER_ID,
-                "user_nickname": "42yoru",
+                "user_nickname": "主人",
                 "user_cardname": "",
                 "account_id": "10001",
                 "platform": PLATFORM,
@@ -94,8 +100,10 @@ class FakeHost:
         self.proactive_result: Dict[str, Any] = {
             "success": True,
             "queued": True,
-            "task_id": "proactive:yeye.owner-reminder:1",
+            "task_id": f"proactive:{PLUGIN_ID}:1",
         }
+        self.config_calls: List[Dict[str, Any]] = []
+        self.config_result: Dict[str, Any] = {"success": True, "value": BOT_NICKNAME}
         self.capability_calls: List[str] = []
 
     async def rpc(
@@ -125,6 +133,9 @@ class FakeHost:
         if capability == "maisaka.proactive.trigger":
             self.proactive_calls.append(dict(args))
             return self.proactive_result
+        if capability == "config.get":
+            self.config_calls.append(dict(args))
+            return self.config_result
         raise AssertionError(f"未预期的能力调用: {capability}")
 
     @property
@@ -149,7 +160,7 @@ class PluginTestCase(IsolatedAsyncioTestCase):
         """构造并加载插件实例。"""
 
         context = PluginContext(
-            plugin_id="yeye.owner-reminder",
+            plugin_id=PLUGIN_ID,
             rpc_call=self.host.rpc,
             paths=PluginPaths(data_dir=self.tmp_dir, runtime_dir=self.tmp_dir),
         )
@@ -161,9 +172,16 @@ class PluginTestCase(IsolatedAsyncioTestCase):
 
     @staticmethod
     def build_config(**sections: Any) -> Dict[str, Any]:
-        """构造插件配置字典；只覆盖传入的配置节。"""
+        """构造插件配置字典；只覆盖传入的配置节。
 
-        config: Dict[str, Any] = {"plugin": {"enabled": True, "config_version": "0.1.0"}}
+        配置模型里的 ``owner.owners`` 默认为空（发布版不该带任何人的账号），
+        所以这里显式给一个主人，模拟"已经配置好主人"的实例。
+        """
+
+        config: Dict[str, Any] = {
+            "plugin": {"enabled": True, "config_version": _MANIFEST["version"]},
+            "owner": {"owners": [OWNER]},
+        }
         config.update(sections)
         return config
 
@@ -292,6 +310,71 @@ class PluginTestCase(IsolatedAsyncioTestCase):
         self.assertIn("只支持 ask / silent", self.host.last_receipt)
         self.assertFalse(self.store_path().exists())
 
+    # ──── 兑现即消费 ────
+
+    async def test_dispatch_marks_reminder_dispatched(self) -> None:
+        """投递成功要在状态里记下"投递过"，这是之后能被消费的前提。"""
+
+        plugin = await self.build_plugin()
+
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
+
+        saved = self.read_store()["reminders"][0]
+        self.assertGreater(saved["dispatched_at"], 0.0)
+
+    async def test_reply_consumes_dispatched_reminder(self) -> None:
+        """她在目标流开口后，投递过的叮嘱立刻消失。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
+        self.assertEqual(len(plugin.store.active_for(TARGET_SESSION, time.time())), 1)
+
+        await plugin.consume_after_reply(session_id=TARGET_SESSION)
+
+        self.assertEqual(plugin.store.active_all(time.time()), [])
+        self.assertEqual(self.read_store()["reminders"], [])
+
+    async def test_reply_in_other_stream_does_not_consume(self) -> None:
+        """别的聊天流说话不算兑现。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
+
+        await plugin.consume_after_reply(session_id=ISSUER_SESSION)
+
+        self.assertEqual(len(plugin.store.active_for(TARGET_SESSION, time.time())), 1)
+
+    async def test_silent_reminder_is_not_consumed(self) -> None:
+        """silent 模式没有投递，她开口也不该把它吃掉，仍按 TTL 兜底。"""
+
+        plugin = await self.build_plugin(dispatch={"mode": "silent"})
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 早点睡"))
+
+        await plugin.consume_after_reply(session_id=TARGET_SESSION)
+
+        self.assertEqual(len(plugin.store.active_for(TARGET_SESSION, time.time())), 1)
+
+    async def test_failed_dispatch_is_not_consumed(self) -> None:
+        """投递失败没记 dispatched，因此不会被一次回复顺走。"""
+
+        self.host.proactive_result = {"success": False, "error": "未找到已存在的聊天流: xxx"}
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
+
+        await plugin.consume_after_reply(session_id=TARGET_SESSION)
+
+        self.assertEqual(len(plugin.store.active_for(TARGET_SESSION, time.time())), 1)
+
+    async def test_consume_switch_off_keeps_reminder(self) -> None:
+        """关掉 consume_on_reply 就回到纯 TTL 行为。"""
+
+        plugin = await self.build_plugin(reminder={"consume_on_reply": False})
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
+
+        await plugin.consume_after_reply(session_id=TARGET_SESSION)
+
+        self.assertEqual(len(plugin.store.active_for(TARGET_SESSION, time.time())), 1)
+
     async def test_owner_whitelist_silently_ignores_others(self) -> None:
         """非主人下达：不回执、不落盘。"""
 
@@ -336,7 +419,7 @@ class PluginTestCase(IsolatedAsyncioTestCase):
 
         saved = self.read_store()["reminders"][0]
         self.assertEqual(saved["target_session_id"], ISSUER_SESSION)
-        self.assertEqual(saved["target_label"], "42yoru的私聊")
+        self.assertEqual(saved["target_label"], "主人的私聊")
 
     async def test_current_group_is_resolved_by_group_id(self) -> None:
         """在群里下达且省略群号时，用当前群号反查真实聊天流。"""
@@ -446,7 +529,7 @@ class PluginTestCase(IsolatedAsyncioTestCase):
         """能力返回不是列表时明确报错。"""
 
         context = PluginContext(
-            plugin_id="yeye.owner-reminder",
+            plugin_id=PLUGIN_ID,
             rpc_call=self.host.rpc,
             paths=PluginPaths(data_dir=self.tmp_dir, runtime_dir=self.tmp_dir),
         )
@@ -742,7 +825,7 @@ class CommandComponentTestCase(TestCase):
         self.assertIsNone(pattern.search("/influence2 你好"))
 
     def test_hook_is_declared(self) -> None:
-        """planner hook 是 blocking + late。"""
+        """planner 注入 hook 是 blocking + late；消费 hook 也是 blocking。"""
 
         hook_metadata = {
             component["name"]: component["metadata"]
@@ -754,6 +837,11 @@ class CommandComponentTestCase(TestCase):
         self.assertEqual(inject_metadata["hook"], "maisaka.planner.before_request")
         self.assertEqual(inject_metadata["mode"], "blocking")
         self.assertEqual(inject_metadata["order"], "late")
+
+        self.assertIn("owner_reminder_consume", hook_metadata)
+        consume_metadata = hook_metadata["owner_reminder_consume"]
+        self.assertEqual(consume_metadata["hook"], "maisaka.reply.before_post_process")
+        self.assertEqual(consume_metadata["mode"], "blocking")
 
     def test_tools_are_declared_private_scoped(self) -> None:
         """两个自然语言工具都必须把 chat_scope=private 暴露在**顶层**。
@@ -846,13 +934,13 @@ class ArgumentParseTestCase(TestCase):
     def test_alias_aware_target_parsing(self) -> None:
         """传入 is_alias 后，首个 token 是代号时也当成目标。"""
 
-        known = {"夜羊群"}
-        parsed = ARGS_MODULE.parse_command("夜羊群 别吵了", is_alias=known.__contains__)
+        known = {"技术群"}
+        parsed = ARGS_MODULE.parse_command("技术群 别吵了", is_alias=known.__contains__)
         self.assertTrue(parsed.ok)
-        self.assertEqual(parsed.target_group_id, "夜羊群")
+        self.assertEqual(parsed.target_group_id, "技术群")
         self.assertEqual(parsed.content, "别吵了")
 
-        missing_content = ARGS_MODULE.parse_command("夜羊群", is_alias=known.__contains__)
+        missing_content = ARGS_MODULE.parse_command("技术群", is_alias=known.__contains__)
         self.assertFalse(missing_content.ok)
         self.assertIn("后面缺少叮嘱内容", missing_content.error)
 
@@ -979,6 +1067,79 @@ class StoreTestCase(TestCase):
         self.assertEqual(len(removed), 2)
         self.assertEqual(self.store.active_all(1002.0), [])
 
+    def test_mark_dispatched_persists_and_survives_reload(self) -> None:
+        """投递时刻落盘，重开存储后仍记得"投递过"。"""
+
+        reminder = self._create(now=1000.0)
+        self.assertFalse(reminder.dispatched)
+
+        updated = self.store.mark_dispatched(reminder.id, 1005.0)
+
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.dispatched_at, 1005.0)
+        self.assertTrue(updated.dispatched)
+
+        reopened = STORE_MODULE.ReminderStore(
+            Path(self._tmp.name), max_per_target=3, strong_ratio=0.33
+        )
+        self.assertEqual([item.dispatched for item in reopened.active_all(1006.0)], [True])
+
+    def test_mark_dispatched_unknown_id_returns_none(self) -> None:
+        """编号不存在时返回 None，不凭空造条目。"""
+
+        self._create(now=1000.0)
+
+        self.assertIsNone(self.store.mark_dispatched("不存在", 1001.0))
+        self.assertEqual(len(self.store.active_all(1001.0)), 1)
+
+    def test_consume_only_touches_dispatched_items_of_target(self) -> None:
+        """只消费目标流里投递过的条目：没投递的、别的流的都不动。"""
+
+        dispatched = self._create(now=1000.0, content="投递过的")
+        self.store.mark_dispatched(dispatched.id, 1001.0)
+        silent, _ = self.store.create(
+            target_session_id=TARGET_SESSION,
+            target_label=GROUP_NAME,
+            content="没投递的",
+            issuer=OWNER,
+            source_session_id=ISSUER_SESSION,
+            ttl_seconds=600.0,
+            now=1002.0,
+        )
+        other, _ = self.store.create(
+            target_session_id="别的会话",
+            target_label="别的群",
+            content="别的群的",
+            issuer=OWNER,
+            source_session_id=ISSUER_SESSION,
+            ttl_seconds=600.0,
+            now=1003.0,
+        )
+
+        consumed = self.store.consume_dispatched(TARGET_SESSION)
+
+        self.assertEqual([item.id for item in consumed], [dispatched.id])
+        self.assertEqual(
+            {item.id for item in self.store.active_all(1004.0)}, {silent.id, other.id}
+        )
+
+    def test_consume_without_hits_leaves_store_untouched(self) -> None:
+        """没有可消费条目时不写盘、不误删。"""
+
+        reminder = self._create(now=1000.0)
+
+        self.assertEqual(self.store.consume_dispatched(TARGET_SESSION), [])
+        self.assertEqual(self.store.consume_dispatched("没有的会话"), [])
+
+        self.assertEqual(len(self.store.active_all(1001.0)), 1)
+        self.assertEqual(self.read_dispatched_at(), 0.0)
+
+    def read_dispatched_at(self) -> float:
+        """读取状态文件里第一条叮嘱的投递时刻。"""
+
+        payload = json.loads(self.store.path.read_text(encoding="utf-8"))
+        return float(payload["reminders"][0]["dispatched_at"])
+
 
 class AliasAndToolTestCase(PluginTestCase):
     """二期：自然语言工具与群代号。"""
@@ -1013,14 +1174,14 @@ class AliasAndToolTestCase(PluginTestCase):
         plugin = await self.build_plugin()
 
         saved = await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
         self.assertTrue(saved["success"])
         self.assertIn("记住了", saved["content"])
-        self.assertIn("夜羊群", saved["content"])
+        self.assertIn("技术群", saved["content"])
         self.assertEqual(self.read_aliases()["version"], 1)
         entry = self.read_aliases()["aliases"][0]
-        self.assertEqual(entry["name"], "夜羊群")
+        self.assertEqual(entry["name"], "技术群")
         self.assertEqual(entry["group_id"], GROUP_ID)
         self.assertEqual(entry["group_label"], GROUP_NAME)
         self.assertEqual(entry["platform"], PLATFORM)
@@ -1028,18 +1189,18 @@ class AliasAndToolTestCase(PluginTestCase):
         listed = await plugin.handle_owner_chat_alias(action="list", **self.tool_kwargs())
         self.assertTrue(listed["success"])
         self.assertIn("群代号（1 个）", listed["content"])
-        self.assertIn(f"夜羊群 = {GROUP_ID}", listed["content"])
+        self.assertIn(f"技术群 = {GROUP_ID}", listed["content"])
         self.assertIn(GROUP_NAME, listed["content"])
 
         removed = await plugin.handle_owner_chat_alias(
-            action="remove", alias="夜羊群", **self.tool_kwargs()
+            action="remove", alias="技术群", **self.tool_kwargs()
         )
         self.assertTrue(removed["success"])
         self.assertIn("已删除代号", removed["content"])
         self.assertEqual(self.read_aliases()["aliases"], [])
 
         again = await plugin.handle_owner_chat_alias(
-            action="remove", alias="夜羊群", **self.tool_kwargs()
+            action="remove", alias="技术群", **self.tool_kwargs()
         )
         self.assertFalse(again["success"])
         self.assertIn("没有代号", again["content"])
@@ -1066,7 +1227,7 @@ class AliasAndToolTestCase(PluginTestCase):
         self.assertIn("纯数字", numeric["content"])
 
         spaced = await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊 群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术 群", group=GROUP_ID, **self.tool_kwargs()
         )
         self.assertFalse(spaced["success"])
         self.assertIn("空格", spaced["content"])
@@ -1086,7 +1247,7 @@ class AliasAndToolTestCase(PluginTestCase):
         plugin = await self.build_plugin()
 
         result = await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
 
         self.assertFalse(result["success"])
@@ -1115,10 +1276,10 @@ class AliasAndToolTestCase(PluginTestCase):
         plugin = await self.build_plugin()
 
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group="982628545", **self.tool_kwargs()
+            action="set", alias="技术群", group="982628545", **self.tool_kwargs()
         )
 
         aliases = self.read_aliases()["aliases"]
@@ -1143,7 +1304,7 @@ class AliasAndToolTestCase(PluginTestCase):
 
         directive = await plugin.handle_owner_directive(content="别吵了", chat=GROUP_ID, **outsider)
         alias = await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **outsider
+            action="set", alias="技术群", group=GROUP_ID, **outsider
         )
 
         self.assertFalse(directive["success"])
@@ -1173,15 +1334,15 @@ class AliasAndToolTestCase(PluginTestCase):
 
         plugin = await self.build_plugin()
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
 
         result = await plugin.handle_owner_directive(
-            content="别继续和某人争执，语气放软", chat="夜羊群", **self.tool_kwargs()
+            content="别继续和某人争执，语气放软", chat="技术群", **self.tool_kwargs()
         )
 
         self.assertTrue(result["success"])
-        self.assertIn("《夜羊群》", result["content"])
+        self.assertIn("《技术群》", result["content"])
         self.assertIn(GROUP_NAME, result["content"])
 
         payload = self.read_store()
@@ -1215,7 +1376,7 @@ class AliasAndToolTestCase(PluginTestCase):
 
         plugin = await self.build_plugin()
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
 
         result = await plugin.handle_owner_directive(
@@ -1224,7 +1385,7 @@ class AliasAndToolTestCase(PluginTestCase):
 
         self.assertFalse(result["success"])
         self.assertIn("没有找到代号「羊群」", result["content"])
-        self.assertIn("夜羊群", result["content"])
+        self.assertIn("技术群", result["content"])
         self.assertFalse(self.store_path().exists())
 
     async def test_directive_tool_without_any_alias(self) -> None:
@@ -1274,16 +1435,16 @@ class AliasAndToolTestCase(PluginTestCase):
 
         plugin = await self.build_plugin()
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
 
         success, _, _ = await plugin.handle_owner_reminder(
-            **self.command_kwargs("夜羊群 别吵了")
+            **self.command_kwargs("技术群 别吵了")
         )
 
         self.assertTrue(success)
         self.assertEqual(self.read_store()["reminders"][0]["target_session_id"], TARGET_SESSION)
-        self.assertIn("《夜羊群》", self.host.last_receipt)
+        self.assertIn("《技术群》", self.host.last_receipt)
 
     # ──── 主人私聊里的代号对照注入 ────
 
@@ -1292,7 +1453,7 @@ class AliasAndToolTestCase(PluginTestCase):
 
         plugin = await self.build_plugin()
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
         items = self.sample_items()
 
@@ -1305,7 +1466,41 @@ class AliasAndToolTestCase(PluginTestCase):
         note = modified[-1]["parts"][0]["text"]
         self.assertIn("群代号", note)
         self.assertIn("owner_directive", note)
-        self.assertIn(f"夜羊群={GROUP_ID}", note)
+        self.assertIn(f"技术群={GROUP_ID}", note)
+
+    async def test_owner_note_uses_host_bot_nickname(self) -> None:
+        """代号对照里的 bot 称呼来自宿主配置，不写死在插件里。"""
+
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
+        )
+
+        result = await plugin.inject_owner_reminder(
+            session_id=ISSUER_SESSION, items=self.sample_items(), item_schema_version=1
+        )
+
+        note = result["modified_kwargs"]["items"][-1]["parts"][0]["text"]
+        self.assertIn(BOT_NICKNAME, note)
+        self.assertIn("config.get", self.host.capability_calls)
+        self.assertEqual(self.host.config_calls[0]["key"], "bot.nickname")
+
+    async def test_owner_note_falls_back_when_nickname_missing(self) -> None:
+        """读不到昵称时退回中性的「你」，不报错也不阻碍加载。"""
+
+        self.host.config_result = {"success": False, "value": None, "error": "配置项不存在"}
+        plugin = await self.build_plugin()
+        await plugin.handle_owner_chat_alias(
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
+        )
+
+        result = await plugin.inject_owner_reminder(
+            session_id=ISSUER_SESSION, items=self.sample_items(), item_schema_version=1
+        )
+
+        note = result["modified_kwargs"]["items"][-1]["parts"][0]["text"]
+        self.assertIn("主人要让你影响别的聊天流", note)
+        self.assertEqual(plugin._bot_nickname, "")
 
     async def test_owner_note_absent_without_alias(self) -> None:
         """没有代号时主人私聊也零改动。"""
@@ -1324,7 +1519,7 @@ class AliasAndToolTestCase(PluginTestCase):
 
         plugin = await self.build_plugin()
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
 
         group_items = self.sample_items()
@@ -1344,7 +1539,7 @@ class AliasAndToolTestCase(PluginTestCase):
 
         plugin = await self.build_plugin(alias={"inject_into_owner_chat": False})
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
         items = self.sample_items()
 
@@ -1360,7 +1555,7 @@ class AliasAndToolTestCase(PluginTestCase):
         self.host.private_streams = []
         plugin = await self.build_plugin()
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
         items = self.sample_items()
 
@@ -1376,7 +1571,7 @@ class AliasAndToolTestCase(PluginTestCase):
 
         plugin = await self.build_plugin()
         await plugin.handle_owner_chat_alias(
-            action="set", alias="夜羊群", group=GROUP_ID, **self.tool_kwargs()
+            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
         await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
 
@@ -1431,11 +1626,11 @@ class AliasStoreTestCase(TestCase):
         """重启后代号还在，且不遗留临时文件。"""
 
         self.store.set(
-            name="夜羊群", group_id=GROUP_ID, platform=PLATFORM, group_label=GROUP_NAME, now=1.0
+            name="技术群", group_id=GROUP_ID, platform=PLATFORM, group_label=GROUP_NAME, now=1.0
         )
 
         reopened = ALIAS_MODULE.AliasStore(Path(self._tmp.name))
-        self.assertEqual([item.name for item in reopened.all()], ["夜羊群"])
+        self.assertEqual([item.name for item in reopened.all()], ["技术群"])
         self.assertEqual(
             sorted(path.name for path in Path(self._tmp.name).iterdir()), ["aliases.json"]
         )
@@ -1472,12 +1667,13 @@ class ConfigFileTestCase(TestCase):
 
         self.assertFalse(changed, f"config.toml 与配置模型不一致: {normalized}")
         self.assertTrue(normalized["plugin"]["enabled"])
-        self.assertEqual(normalized["plugin"]["config_version"], "0.2.0")
-        self.assertEqual(normalized["owner"]["owners"], ["qq:1215349250"])
+        self.assertEqual(normalized["plugin"]["config_version"], "0.3.0")
+        self.assertIsInstance(normalized["owner"]["owners"], list)
         self.assertEqual(normalized["reminder"]["default_ttl_seconds"], 600)
         self.assertEqual(normalized["reminder"]["strong_ratio"], 0.33)
         self.assertEqual(normalized["reminder"]["max_per_target"], 3)
         self.assertEqual(normalized["reminder"]["max_content_chars"], 200)
+        self.assertTrue(normalized["reminder"]["consume_on_reply"])
         self.assertEqual(normalized["target"]["platform"], "qq")
         self.assertEqual(normalized["target"]["account_id"], "")
         self.assertTrue(normalized["inject"]["enabled"])
@@ -1492,8 +1688,9 @@ class ConfigFileTestCase(TestCase):
 
         self.assertEqual(manifest["manifest_version"], 2)
         self.assertEqual(manifest["version"], raw["plugin"]["config_version"])
-        self.assertEqual(manifest["id"], "yeye.owner-reminder")
+        self.assertEqual(manifest["id"], PLUGIN_ID)
         self.assertIn("maisaka.proactive.trigger", manifest["capabilities"])
+        self.assertIn("config.get", manifest["capabilities"])
 
 
 class InjectionTextTestCase(TestCase):

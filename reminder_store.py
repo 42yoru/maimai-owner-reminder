@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
@@ -36,6 +36,14 @@ class Reminder:
     source_session_id: str
     created_at: float
     ttl_seconds: float
+    # 朝目标流投递过一次提醒的时刻；0 表示没有投递过（silent 模式，或投递失败）
+    dispatched_at: float = 0.0
+
+    @property
+    def dispatched(self) -> bool:
+        """这条叮嘱是否已经朝目标流投递过提醒。"""
+
+        return self.dispatched_at > 0.0
 
     def stage(self, now: float, strong_ratio: float) -> ReminderStage:
         """按墙上时钟判断这条叮嘱当前处在哪一档。
@@ -138,6 +146,10 @@ class ReminderStore:
             ttl_seconds = float(raw["ttl_seconds"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ReminderStoreError(f"叮嘱条目时间字段不合法: {raw!r}") from exc
+        try:
+            dispatched_at = float(raw.get("dispatched_at") or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ReminderStoreError(f"叮嘱条目投递时间字段不合法: {raw!r}") from exc
         return Reminder(
             id=raw["id"].strip(),
             target_session_id=raw["target_session_id"].strip(),
@@ -147,6 +159,7 @@ class ReminderStore:
             source_session_id=raw["source_session_id"].strip(),
             created_at=created_at,
             ttl_seconds=ttl_seconds,
+            dispatched_at=dispatched_at,
         )
 
     def _write_file(self, reminders: List[Reminder]) -> None:
@@ -240,6 +253,49 @@ class ReminderStore:
         self._reminders.append(reminder)
         self._write_file(self._reminders)
         return reminder, evicted
+
+    # ──── 投递与消费 ────
+
+    def mark_dispatched(self, reminder_id: str, now: float) -> Optional[Reminder]:
+        """记录这条叮嘱已经朝目标流投递过一次提醒。
+
+        只有投递过的条目才会被"兑现即消费"清掉：silent 模式没有投递，
+        也就没有"因为叮嘱触发一次发言"这回事，必须继续按 TTL 兜底。
+
+        Returns:
+            Optional[Reminder]: 更新后的条目；找不到时返回 None。
+        """
+
+        self.purge_expired(now)
+        for item in self._ensure_loaded():
+            if item.id != reminder_id:
+                continue
+            updated = replace(item, dispatched_at=now)
+            self._reminders = [
+                updated if candidate.id == item.id else candidate for candidate in self._ensure_loaded()
+            ]
+            self._write_file(self._reminders)
+            return updated
+        return None
+
+    def consume_dispatched(self, session_id: str) -> List[Reminder]:
+        """消费掉目标流里已经投递过的叮嘱：她已经在那个聊天流说过话了。
+
+        只清"投递过"的条目；没有投递过（silent / 投递失败）的条目保持原样，
+        继续由 TTL 决定寿命。
+
+        Returns:
+            List[Reminder]: 被消费掉的条目；没有可消费条目时不写盘。
+        """
+
+        reminders = self._ensure_loaded()
+        hits = [item for item in reminders if item.target_session_id == session_id and item.dispatched]
+        if not hits:
+            return []
+        consumed_ids = {item.id for item in hits}
+        self._reminders = [item for item in reminders if item.id not in consumed_ids]
+        self._write_file(self._reminders)
+        return hits
 
     def revoke(self, reminder_id: str, now: float) -> Optional[Reminder]:
         """按编号撤销一条叮嘱；找不到时返回 None。"""

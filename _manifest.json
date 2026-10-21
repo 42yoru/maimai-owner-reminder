@@ -1,18 +1,18 @@
 {
   "manifest_version": 2,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "name": "主人的叮嘱 (Owner Reminder)",
-  "description": "主人在任意聊天流下达一条短期叮嘱，作用于指定的另一个聊天流：以强/弱两档影响她的 planner，到期自动淡出。支持 /叮嘱 命令与自然语言工具，并可用群代号指代群。纯插件实现，不改主程序。",
+  "description": "主人在任意聊天流下达一条短期叮嘱，作用于指定的另一个聊天流：以强/弱两档影响该流 planner；投递过提醒的叮嘱在 bot 于目标流开口后立即消费，没兑现的就按 TTL 到期淡出。支持 /叮嘱 命令与自然语言工具，并可用群代号指代群。纯插件实现，不改主程序。",
   "author": {
-    "name": "YeYe",
+    "name": "42yoru",
     "url": "https://github.com/42yoru"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/42yoru/yeye_owner_reminder",
-    "homepage": "https://github.com/42yoru/yeye_owner_reminder",
-    "documentation": "https://github.com/42yoru/yeye_owner_reminder/blob/main/README.md",
-    "issues": "https://github.com/42yoru/yeye_owner_reminder/issues"
+    "repository": "https://github.com/42yoru/maimai-owner-reminder",
+    "homepage": "https://github.com/42yoru/maimai-owner-reminder",
+    "documentation": "https://github.com/42yoru/maimai-owner-reminder/blob/main/README.md",
+    "issues": "https://github.com/42yoru/maimai-owner-reminder/issues"
   },
   "host_application": {
     "min_version": "1.3.9",
@@ -26,6 +26,7 @@
   "capabilities": [
     "chat.get_group_streams",
     "chat.get_private_streams",
+    "config.get",
     "send.text",
     "maisaka.proactive.trigger"
   ],
@@ -35,5 +36,5 @@
       "zh-CN"
     ]
   },
-  "id": "yeye.owner-reminder"
+  "id": "maimai.owner-reminder"
 }
