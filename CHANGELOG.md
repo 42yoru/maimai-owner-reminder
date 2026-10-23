@@ -1,5 +1,15 @@
 # 更新记录
 
+## 0.4.2
+
+**细节**
+
+- 插件 ID 改为 `github.42yoru.maimai-owner-reminder`：与插件中心推荐的
+  `github.<用户名>.<插件名>` 一致，也和同作者的模拟盘插件统一
+- 数据目录随 ID 变化（`data/plugins/<id>/`），老的 `maimai.owner-reminder` 目录里的
+  `aliases.json` / `reminders.json` 需要手动搬到新目录；插件本身不自动迁移
+- 版本与 config_version 升到 0.4.2，行为无变化
+
 ## 0.4.1
 
 **细节**

@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "0.4.1"
+config_version = "0.4.2"
 
 [owner]
 # 只有这些用户可以下达叮嘱，格式为 platform:user_id，例如 "qq:123456789"
