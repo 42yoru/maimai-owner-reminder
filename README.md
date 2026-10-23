@@ -249,4 +249,4 @@ python -m unittest discover -s tests -t .
 
 ## 许可证
 
-代码用 [MIT](LICENSE)。插件图标（`icon.png`）是几何绘制，随本插件一同以 MIT 发布。
+代码用 [MIT](LICENSE)。插件图标（`icon.png`）由作者用 AI 图像模型生成，随本插件一同以 MIT 发布。
