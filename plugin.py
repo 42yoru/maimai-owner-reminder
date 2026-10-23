@@ -68,7 +68,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.3", description="配置版本")
+    config_version: str = Field(default="0.4.4", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -523,7 +523,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
             mode=mode,
         )
         await self._send(context["stream_id"], receipt)
-        return reminder is not None, None, True
+        return reminder is not None, None, 1
 
     async def _handle_list(self, context: Dict[str, str]) -> Tuple[bool, Optional[str], int]:
         """查看生效中的叮嘱。"""
