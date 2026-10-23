@@ -1,6 +1,7 @@
 {
   "manifest_version": 2,
-  "version": "0.4.2",
+  "version": "0.4.3",
+  "plugin_type": "tool",
   "name": "主人的叮嘱 (Owner Reminder)",
   "description": "主人在任意聊天流下达一条短期叮嘱，作用于指定的另一个聊天流：以强/弱两档影响该流 planner；投递过提醒的叮嘱在 bot 于目标流开口后立即消费，没兑现的就按 TTL 到期淡出。支持 /叮嘱 命令与自然语言工具，并可用群代号指代群。纯插件实现，不改主程序。",
   "display": {

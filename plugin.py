@@ -68,7 +68,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.2", description="配置版本")
+    config_version: str = Field(default="0.4.3", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -450,11 +450,11 @@ class OwnerReminderPlugin(MaiBotPlugin):
         description="主人的叮嘱：下达 / 查看 / 撤销作用于指定聊天流的短期叮嘱",
         pattern=r"(?s)^/(?:叮嘱|influence)(?![0-9A-Za-z_])(?P<rest>.*)$",
     )
-    async def handle_owner_reminder(self, **kwargs: Any) -> Tuple[bool, Optional[str], bool]:
+    async def handle_owner_reminder(self, **kwargs: Any) -> Tuple[bool, Optional[str], int]:
         """处理 ``/叮嘱``、``/叮嘱列表``、``/叮嘱撤销`` 三种形态。"""
 
         if not self.config.plugin.enabled:
-            return False, None, True
+            return False, None, 1
 
         context = self._invocation_context(kwargs)
         if not self._is_owner(context["platform"], context["user_id"]):
@@ -463,7 +463,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
                 context["platform"],
                 context["user_id"],
             )
-            return False, None, True
+            return False, None, 1
 
         rest = str((kwargs.get("matched_groups") or {}).get("rest") or "")
         request = parse_command(rest, is_alias=self._is_registered_alias)
@@ -471,18 +471,18 @@ class OwnerReminderPlugin(MaiBotPlugin):
         if request.action == ACTION_LIST:
             if not request.ok:
                 await self._send(context["stream_id"], build_usage_text(request.error))
-                return False, None, True
+                return False, None, 1
             return await self._handle_list(context)
 
         if request.action == ACTION_REVOKE:
             if not request.ok:
                 await self._send(context["stream_id"], build_usage_text(request.error))
-                return False, None, True
+                return False, None, 1
             return await self._handle_revoke(context, request.argument)
 
         if not request.ok:
             await self._send(context["stream_id"], build_usage_text(request.error))
-            return False, None, True
+            return False, None, 1
 
         return await self._handle_set(request, context=context)
 
@@ -491,7 +491,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         request: CommandRequest,
         *,
         context: Dict[str, str],
-    ) -> Tuple[bool, Optional[str], bool]:
+    ) -> Tuple[bool, Optional[str], int]:
         """下达一条叮嘱：解析目标、落盘、投递提醒并回执。"""
 
         mode = self.config.dispatch.mode.strip().lower()
@@ -502,7 +502,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
                     f"插件配置 dispatch.mode 只支持 {' / '.join(DISPATCH_MODES)}，当前为 {self.config.dispatch.mode!r}"
                 ),
             )
-            return False, None, True
+            return False, None, 1
 
         self._remember_owner_session(context)
         resolved = await self._resolve_target_with_alias(
@@ -511,7 +511,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         )
         if isinstance(resolved, str):
             await self._send(context["stream_id"], build_error_text(resolved))
-            return False, None, True
+            return False, None, 1
 
         target, alias_name = resolved
         reminder, receipt = await self._apply_directive(
@@ -525,7 +525,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         await self._send(context["stream_id"], receipt)
         return reminder is not None, None, True
 
-    async def _handle_list(self, context: Dict[str, str]) -> Tuple[bool, Optional[str], bool]:
+    async def _handle_list(self, context: Dict[str, str]) -> Tuple[bool, Optional[str], int]:
         """查看生效中的叮嘱。"""
 
         now = time.time()
@@ -537,23 +537,23 @@ class OwnerReminderPlugin(MaiBotPlugin):
                 strong_ratio=self.config.reminder.strong_ratio,
             ),
         )
-        return True, None, True
+        return True, None, 1
 
-    async def _handle_revoke(self, context: Dict[str, str], argument: str) -> Tuple[bool, Optional[str], bool]:
+    async def _handle_revoke(self, context: Dict[str, str], argument: str) -> Tuple[bool, Optional[str], int]:
         """撤销一条或全部叮嘱。"""
 
         now = time.time()
         if is_revoke_all(argument):
             removed = self.store.revoke_all(now)
             await self._send(context["stream_id"], build_revoked_text(None, removed))
-            return True, None, True
+            return True, None, 1
 
         removed_one = self.store.revoke(argument, now)
         if removed_one is None:
             await self._send(context["stream_id"], build_missing_reminder_text(argument))
-            return False, None, True
+            return False, None, 1
         await self._send(context["stream_id"], build_revoked_text(removed_one, ()))
-        return True, None, True
+        return True, None, 1
 
     # ──── 自然语言工具（只在私聊可见） ────
 

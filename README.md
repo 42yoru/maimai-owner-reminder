@@ -71,7 +71,7 @@ cd MaiBot/plugins
 git clone https://github.com/42yoru/maimai-owner-reminder.git
 ```
 
-`config.toml` 跟着仓库一起来（通用版，注释齐全）。删掉也没关系——宿主会按配置模型自动生成一份。
+仓库里**不带** `config.toml`（它被 `.gitignore` 挡住）。启动后宿主会按配置模型自动生成一份，里面就是上面那些默认值；想改就直接改它，或者去 WebUI 的配置页点。
 
 ### 第 2 步：填主人白名单
 
@@ -219,7 +219,6 @@ maimai_owner_reminder/
 ├── target_resolver.py  # 群号 → 真实 session_id，解析不到或多命中就报错
 ├── config_ui.py        # WebUI 配置页的中文展示布局（只重组 schema）
 ├── tests/             # 单测，不需要额外依赖
-├── config.toml         # 通用版配置（owners 故意留空）
 ├── icon.png            # 插件图标
 └── _manifest.json
 ```
@@ -231,9 +230,9 @@ cd plugins/maimai_owner_reminder
 python -m unittest discover -s tests -t .
 ```
 
-147 项测试，覆盖：无内容时零改动、注入项结构与 schema 回传、TTL 分档边界、目标解析失败与多命中消歧、
+148 项测试，覆盖：无内容时零改动、注入项结构与 schema 回传、TTL 分档边界、目标解析失败与多命中消歧、
 账号不匹配报错、`ask` / `silent` 分支、非主人静默忽略、列表与撤销、同目标超上限替换、状态文件损坏与缺字段、
-`config.toml` 与配置模型一致、两个工具的权限与分支、代号的增删查与解析、主人私聊对照表的注入条件、
+默认配置的稳定性与「config.toml 不进仓库」、两个工具的权限与分支、代号的增删查与解析、主人私聊对照表的注入条件、
 投递记账与「兑现即消费」、以及 WebUI 配置页的中文标签与「不许丢字段」。
 
 ## 贡献

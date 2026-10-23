@@ -4,3 +4,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.tmp
+
+# 运行时配置由宿主按 config_model 生成，不进仓库
+/config.toml

@@ -19,7 +19,6 @@ import re
 import sys
 import tempfile
 import time
-import tomllib
 
 from maibot_sdk import PluginContext, PluginPaths
 from maibot_sdk.types import ComponentType
@@ -1674,16 +1673,18 @@ class AliasStoreTestCase(TestCase):
                 )
 
 
-class ConfigFileTestCase(TestCase):
-    """config.toml 必须与配置模型一致，否则宿主会在加载时自动改写它。"""
+class ConfigModelTestCase(TestCase):
+    """运行时 config.toml 由宿主按配置模型生成，所以这里只验模型本身。"""
 
-    def test_config_toml_matches_model(self) -> None:
-        raw = tomllib.loads((PLUGIN_DIR / "config.toml").read_text(encoding="utf-8"))
+    def test_defaults_are_stable(self) -> None:
+        """默认值就是新用户拿到的那一份，改动等于改变别人的行为。"""
+
         plugin = PLUGIN_MODULE.OwnerReminderPlugin()
+        raw = plugin.build_default_config()
 
         normalized, changed = plugin.normalize_plugin_config(raw)
 
-        self.assertFalse(changed, f"config.toml 与配置模型不一致: {normalized}")
+        self.assertFalse(changed, f"默认配置归一化后不一致: {normalized}")
         self.assertTrue(normalized["plugin"]["enabled"])
         self.assertEqual(normalized["plugin"]["config_version"], MANIFEST_VERSION)
         self.assertIsInstance(normalized["owner"]["owners"], list)
@@ -1700,12 +1701,18 @@ class ConfigFileTestCase(TestCase):
         self.assertTrue(normalized["tool"]["enabled"])
         self.assertTrue(normalized["alias"]["inject_into_owner_chat"])
 
+    def test_config_toml_is_not_committed(self) -> None:
+        """运行时配置不能进仓库：用户一改就会和仓库版本打架。"""
+
+        gitignore = (PLUGIN_DIR / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("/config.toml", gitignore)
+
     def test_manifest_matches_config_version(self) -> None:
         manifest = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
-        raw = tomllib.loads((PLUGIN_DIR / "config.toml").read_text(encoding="utf-8"))
+        defaults = PLUGIN_MODULE.OwnerReminderPlugin.build_default_config()
 
         self.assertEqual(manifest["manifest_version"], 2)
-        self.assertEqual(manifest["version"], raw["plugin"]["config_version"])
+        self.assertEqual(manifest["version"], defaults["plugin"]["config_version"])
         self.assertEqual(manifest["id"], PLUGIN_ID)
         self.assertIn("maisaka.proactive.trigger", manifest["capabilities"])
         self.assertIn("config.get", manifest["capabilities"])
