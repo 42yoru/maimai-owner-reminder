@@ -1127,7 +1127,7 @@ class StoreTestCase(TestCase):
     def test_consume_without_hits_leaves_store_untouched(self) -> None:
         """没有可消费条目时不写盘、不误删。"""
 
-        reminder = self._create(now=1000.0)
+        self._create(now=1000.0)
 
         self.assertEqual(self.store.consume_dispatched(TARGET_SESSION), [])
         self.assertEqual(self.store.consume_dispatched("没有的会话"), [])
@@ -1709,6 +1709,49 @@ class ConfigFileTestCase(TestCase):
         self.assertEqual(manifest["id"], PLUGIN_ID)
         self.assertIn("maisaka.proactive.trigger", manifest["capabilities"])
         self.assertIn("config.get", manifest["capabilities"])
+
+
+class ConfigUiSchemaTestCase(TestCase):
+    """WebUI 配置页：中文标签、页签、不丢字段。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.schema = PLUGIN_MODULE.OwnerReminderPlugin.build_config_schema(
+            plugin_id=PLUGIN_ID,
+            plugin_name="主人的叮嘱",
+            plugin_version=MANIFEST_VERSION,
+        )
+
+    def test_layout_is_tabs(self) -> None:
+        layout = self.schema["layout"]
+        self.assertEqual(layout["type"], "tabs")
+        self.assertEqual([tab["title"] for tab in layout["tabs"]], ["常用设置", "叮嘱行为", "高级"])
+
+    def test_no_config_field_is_dropped(self) -> None:
+        """每个真实配置节里的每个字段，都必须出现在重组后的 schema 里。"""
+
+        dumped = PLUGIN_MODULE.OwnerReminderConfig().model_dump()
+        expected = {section: set(fields) for section, fields in dumped.items()}
+
+        covered = {}
+        for block in self.schema["sections"].values():
+            covered.setdefault(block["name"], set()).update(block["fields"])
+
+        self.assertEqual(set(covered), set(expected))
+        for section_name, fields in expected.items():
+            self.assertEqual(covered[section_name], fields, f"{section_name} 的字段被漏掉了")
+
+    def test_labels_are_chinese(self) -> None:
+        for block in self.schema["sections"].values():
+            for field_name, field in block["fields"].items():
+                self.assertNotEqual(field["label"], field_name, f"{field_name} 没有中文标签")
+
+    def test_mode_choices_and_readonly_version(self) -> None:
+        dispatch = self.schema["sections"]["dispatch"]["fields"]
+        self.assertEqual(dispatch["mode"]["choices"], ["ask", "silent"])
+
+        plugin_block = self.schema["sections"]["plugin_info"]["fields"]
+        self.assertTrue(plugin_block["config_version"]["disabled"])
 
 
 class InjectionTextTestCase(TestCase):

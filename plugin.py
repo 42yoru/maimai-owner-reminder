@@ -25,6 +25,7 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .alias_store import AliasStore, AliasStoreError
+from .config_ui import build_config_ui_schema
 from .reminder_args import ACTION_LIST, ACTION_REVOKE, CommandRequest, is_revoke_all, parse_command
 from .reminder_store import Reminder, ReminderStage, ReminderStore, ReminderStoreError
 from .reminder_text import (
@@ -67,7 +68,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.3.1", description="配置版本")
+    config_version: str = Field(default="0.4.0", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -201,6 +202,12 @@ class OwnerReminderPlugin(MaiBotPlugin):
     """主人的叮嘱插件。"""
 
     config_model = OwnerReminderConfig
+
+    @classmethod
+    def build_config_schema(cls, **plugin_info: Any) -> Dict[str, Any]:
+        """只重组 WebUI 的展示结构，配置模型与 TOML 路径保持不变。"""
+
+        return build_config_ui_schema(super().build_config_schema(**plugin_info))
 
     def __init__(self) -> None:
         super().__init__()
