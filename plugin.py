@@ -941,6 +941,8 @@ class OwnerReminderPlugin(MaiBotPlugin):
         if mode == "silent":
             return "目标流没有被惊动，她会在下次自然触发时看到这条叮嘱。"
 
+        # 模板写坏（多了个未知占位符）就在这里抛 KeyError，由调用方转成「提醒投递出错」的回执：
+        # 宁可让主人看到一次明确的配置错误，也不要静默发一条没有叮嘱内容的 intent 过去。
         intent = self.config.dispatch.intent_template.format(内容=reminder.content)
         result = await self.ctx.maisaka.proactive.trigger(
             stream_id=reminder.target_session_id,

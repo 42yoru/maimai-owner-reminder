@@ -183,7 +183,10 @@ class ReminderStore:
     # ──── 查询 ────
 
     def active_for(self, session_id: str, now: float) -> List[Reminder]:
-        """返回某个聊天流当前生效的叮嘱，按创建时间升序。"""
+        """返回某个聊天流当前生效的叮嘱，按创建时间升序。
+
+        顺带清掉过期条目：注入路径每轮都会走到这里，过期记录留久了只会让文件越滚越大。
+        """
 
         self.purge_expired(now)
         return sorted(
@@ -192,7 +195,7 @@ class ReminderStore:
         )
 
     def active_all(self, now: float) -> List[Reminder]:
-        """返回全部生效中的叮嘱，按创建时间升序。"""
+        """返回全部生效中的叮嘱，按创建时间升序。清理口径与 active_for 一致。"""
 
         self.purge_expired(now)
         return sorted(self._ensure_loaded(), key=lambda item: item.created_at)
