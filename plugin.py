@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from uuid import uuid4
 
 import time
@@ -68,7 +68,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.4", description="配置版本")
+    config_version: str = Field(default="0.4.5", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -258,7 +258,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
             self.config.dispatch.mode,
             self._bot_nickname or "(未知)",
         )
-        self._warn_if_no_owner()
+        self._warn_if_misconfigured()
 
     def _configured_owners(self) -> List[str]:
         """返回归一化后的主人白名单（去掉空白项）。"""
@@ -266,14 +266,41 @@ class OwnerReminderPlugin(MaiBotPlugin):
         return [item.strip() for item in self.config.owner.owners if item.strip()]
 
     def _warn_if_no_owner(self) -> None:
-        """主人白名单为空时给一条明确提示，免得用户以为插件没装上。"""
+        """主人白名单为空或格式不对时给明确提示，免得用户以为插件没装上。"""
 
-        if self._configured_owners():
+        owners = self._configured_owners()
+        if not owners:
+            self.ctx.logger.warning(
+                "owner.owners 为空：还没有任何人可以下达叮嘱。"
+                "请在 config.toml 的 [owner] 里填上 platform:user_id（例如 qq:123456789），保存后立即生效。"
+            )
+            return
+        # 格式不对的条目永远匹配不上，属于「填了却没权限」，必须在加载时就喊出来
+        broken = [item for item in owners if not _split_owner(item)]
+        if broken:
+            self.ctx.logger.warning(
+                "owner.owners 里有 %s 个条目格式不对，这些条目不会生效: %s。"
+                "正确写法是 platform:user_id（英文冒号，例如 qq:123456789）。",
+                len(broken),
+                broken,
+            )
+
+    def _warn_if_intent_template_is_broken(self) -> None:
+        """ask 模式下模板必须带 {内容}，否则投递出去的指令里根本没有叮嘱本身。"""
+
+        template = self.config.dispatch.intent_template
+        if "{内容}" in template:
             return
         self.ctx.logger.warning(
-            "owner.owners 为空：还没有任何人可以下达叮嘱。"
-            "请在 config.toml 的 [owner] 里填上 platform:user_id（例如 qq:123456789），保存后立即生效。"
+            "dispatch.intent_template 里没有 {内容} 占位符：ask 模式投递出去的指令不会带上叮嘱内容，"
+            "目标流只会收到一句空的「做点什么」。请在 config.toml 的 [dispatch] 一节补上 {内容}。"
         )
+
+    def _warn_if_misconfigured(self) -> None:
+        """加载与热更新时统一做一遍配置体检。"""
+
+        self._warn_if_no_owner()
+        self._warn_if_intent_template_is_broken()
 
     async def on_unload(self) -> None:
         """卸载插件：本插件无常驻任务，无需清理。"""
@@ -289,7 +316,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
         await self._refresh_owner_sessions()
         await self._refresh_bot_nickname()
         self.ctx.logger.info("主人的叮嘱配置已更新: version=%s", version)
-        self._warn_if_no_owner()
+        self._warn_if_misconfigured()
 
     def _build_store(self) -> ReminderStore:
         """按当前配置构造叮嘱状态存储。"""
@@ -387,7 +414,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
             return {"action": "continue"}
 
         try:
-            consumed = self.store.consume_dispatched(session_id)
+            consumed = self.store.consume_dispatched(session_id, time.time())
         except ReminderStoreError as exc:
             # 状态文件出问题时宁可不消费，也不能让一次回复因此失败
             self.ctx.logger.error("消费叮嘱失败: %s", exc)
@@ -783,21 +810,32 @@ class OwnerReminderPlugin(MaiBotPlugin):
         self._bot_nickname = value.strip() if isinstance(value, str) else ""
 
     async def _refresh_owner_sessions(self) -> None:
-        """按 owner 白名单尽力解析出主人的私聊会话 ID。"""
+        """按 owner 白名单尽力解析出主人的私聊会话 ID。
 
+        每次都从空集合重建：白名单删掉某个人之后，他的私聊不该还留着
+        「群代号对照 + 工具提示」这条注入。
+        """
+
+        self._owner_sessions.clear()
+        owners_by_platform: Dict[str, Set[str]] = {}
         for owner in self.config.owner.owners:
-            platform, separator, user_id = owner.partition(":")
-            if not separator or not platform.strip() or not user_id.strip():
+            parsed = _split_owner(owner)
+            if parsed is None:
                 self.ctx.logger.warning("owner.owners 条目格式不正确，已跳过: %r", owner)
                 continue
-            streams = await self.ctx.chat.get_private_streams(platform.strip())
+            platform, user_id = parsed
+            owners_by_platform.setdefault(platform, set()).add(user_id)
+
+        # 同一平台只查一次私聊流，别为一个 owner 列表反复调同一个能力
+        for platform, user_ids in owners_by_platform.items():
+            streams = await self.ctx.chat.get_private_streams(platform)
             if not isinstance(streams, list):
                 self.ctx.logger.warning("读取私聊流返回异常，暂不注入代号表: %r", streams)
                 continue
             for stream in streams:
                 if not isinstance(stream, dict):
                     continue
-                if str(stream.get("user_id") or "").strip() != user_id.strip():
+                if str(stream.get("user_id") or "").strip() not in user_ids:
                     continue
                 session_id = str(stream.get("session_id") or "").strip()
                 if session_id:
@@ -976,6 +1014,21 @@ class OwnerReminderPlugin(MaiBotPlugin):
         sent = await self.ctx.send.text(text, stream_id)
         if not sent:
             self.ctx.logger.error("回执发送失败: stream_id=%s text=%s", stream_id, text)
+
+
+def _split_owner(entry: str) -> Optional[Tuple[str, str]]:
+    """把 `platform:user_id` 拆开；结构不对返回 None。
+
+    只认英文冒号：`qq：123456789`（全角冒号）这类写法永远匹配不上白名单，
+    必须在加载时就把它点出来，否则用户只会看到「填了却没权限」。
+    """
+
+    platform, separator, user_id = str(entry or "").partition(":")
+    platform = platform.strip()
+    user_id = user_id.strip()
+    if not separator or not platform or not user_id:
+        return None
+    return platform, user_id
 
 
 def create_plugin() -> OwnerReminderPlugin:

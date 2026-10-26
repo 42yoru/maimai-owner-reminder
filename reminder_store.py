@@ -281,8 +281,10 @@ class ReminderStore:
             return updated
         return None
 
-    def consume_dispatched(self, session_id: str) -> List[Reminder]:
+    def consume_dispatched(self, session_id: str, now: float) -> List[Reminder]:
         """消费掉目标流里已经投递过的叮嘱：她已经在那个聊天流说过话了。
+
+        先清过期：已经淡出的条目不该被记成「兑现」，否则日志会把自然过期说成消费。
 
         只清"投递过"的条目；没有投递过（silent / 投递失败）的条目保持原样，
         继续由 TTL 决定寿命。
@@ -291,6 +293,7 @@ class ReminderStore:
             List[Reminder]: 被消费掉的条目；没有可消费条目时不写盘。
         """
 
+        self.purge_expired(now)
         reminders = self._ensure_loaded()
         hits = [item for item in reminders if item.target_session_id == session_id and item.dispatched]
         if not hits:

@@ -48,6 +48,18 @@ def build_injection_text(reminder: Reminder, stage: ReminderStage) -> str:
     raise ValueError(f"到期的叮嘱不应生成注入文本: {reminder.id}")
 
 
+def format_duration(seconds: float) -> str:
+    """把一段时间说成人话：整分钟只给分钟，带零头就给「N 分 M 秒」。"""
+
+    total_seconds = max(0, int(round(seconds)))
+    minutes, rest = divmod(total_seconds, 60)
+    if minutes and rest:
+        return f"{minutes} 分 {rest} 秒"
+    if minutes:
+        return f"{minutes} 分钟"
+    return f"{rest} 秒"
+
+
 def format_remaining(seconds: float) -> str:
     """把剩余秒数格式化为 mm:ss。"""
 
@@ -105,7 +117,7 @@ def build_created_receipt(
     )
     lines = [
         f"✅ 已记下叮嘱 #{reminder.id}（作用于{target_part}）",
-        f"   生效 {ttl_seconds / 60:.0f} 分钟，之后自动淡出。查看：{COMMAND_PREFIX}列表",
+        f"   生效 {format_duration(ttl_seconds)}，之后自动淡出。查看：{COMMAND_PREFIX}列表",
     ]
     if truncated:
         lines.append("   ⚠️ 内容超过配置上限，已截断保存。")

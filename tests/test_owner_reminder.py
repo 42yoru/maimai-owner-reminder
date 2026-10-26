@@ -3,8 +3,8 @@
 用标准库 unittest，不依赖 pytest。插件模块按 Runner 的方式（importlib + 子模块搜索路径）
 加载，这样 plugin.py 里的相对导入才可用。
 
-注意：这里不导入宿主 ``src.*``（那会连带启动整个 MaiBot），
-注入项与宿主反序列化器的契约校验见 README「尚未验证」一节的手工步骤。
+注意：这里不导入宿主 ``src.*``（那会连带启动整个 MaiBot），所以注入项与宿主反序列化器的
+契约只能靠「结构断言 + 真机验证」保证，不在单测里跑真实宿主。
 """
 
 from __future__ import annotations
@@ -230,6 +230,22 @@ class PluginTestCase(IsolatedAsyncioTestCase):
         return reminder
 
     # ──── 下达 ────
+
+    async def test_removed_owner_session_is_forgotten(self) -> None:
+        """白名单删掉某个主人后，他的私聊不该还留着代号注入。"""
+
+        plugin = await self.build_plugin()
+        plugin._owner_sessions.add("stale-owner-session")
+
+        empty_owner_config = self.build_config(owner={"owners": []})
+        plugin.set_plugin_config(empty_owner_config)
+        await plugin.on_config_update(
+            scope="self",
+            config_data=empty_owner_config,
+            version=MANIFEST_VERSION,
+        )
+
+        self.assertEqual(plugin._owner_sessions, set())
 
     async def test_set_command_stores_reminder_and_dispatches_once(self) -> None:
         """下达成功：落盘、回执，并按 ask 模式投递一次提醒。"""
@@ -866,6 +882,24 @@ class CommandComponentTestCase(TestCase):
         self.assertTrue(components["owner_chat_alias"]["metadata"]["parameters"])
 
 
+class OwnerEntryAndDurationTestCase(TestCase):
+    """主人条目的格式校验与时长文案。"""
+
+    def test_owner_entry_requires_ascii_colon(self) -> None:
+        """全角冒号这类写法永远匹配不上白名单，必须能被识别成「格式不对」。"""
+
+        self.assertIsNone(PLUGIN_MODULE._split_owner("qq：123456789"))
+        self.assertIsNone(PLUGIN_MODULE._split_owner("qq123456789"))
+        self.assertIsNone(PLUGIN_MODULE._split_owner(":123"))
+        self.assertIsNone(PLUGIN_MODULE._split_owner("qq:"))
+        self.assertEqual(PLUGIN_MODULE._split_owner(" qq : 123 "), ("qq", "123"))
+
+    def test_duration_keeps_half_minutes(self) -> None:
+        self.assertEqual(TEXT_MODULE.format_duration(90), "1 分 30 秒")
+        self.assertEqual(TEXT_MODULE.format_duration(120), "2 分钟")
+        self.assertEqual(TEXT_MODULE.format_duration(45), "45 秒")
+
+
 class ArgumentParseTestCase(TestCase):
     """命令参数解析。"""
 
@@ -1116,7 +1150,7 @@ class StoreTestCase(TestCase):
             now=1003.0,
         )
 
-        consumed = self.store.consume_dispatched(TARGET_SESSION)
+        consumed = self.store.consume_dispatched(TARGET_SESSION, 1004.0)
 
         self.assertEqual([item.id for item in consumed], [dispatched.id])
         self.assertEqual(
@@ -1128,8 +1162,8 @@ class StoreTestCase(TestCase):
 
         self._create(now=1000.0)
 
-        self.assertEqual(self.store.consume_dispatched(TARGET_SESSION), [])
-        self.assertEqual(self.store.consume_dispatched("没有的会话"), [])
+        self.assertEqual(self.store.consume_dispatched(TARGET_SESSION, 1001.0), [])
+        self.assertEqual(self.store.consume_dispatched("没有的会话", 1001.0), [])
 
         self.assertEqual(len(self.store.active_all(1001.0)), 1)
         self.assertEqual(self.read_dispatched_at(), 0.0)
