@@ -71,7 +71,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.8", description="配置版本")
+    config_version: str = Field(default="0.4.9", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -1095,9 +1095,12 @@ class OwnerReminderPlugin(MaiBotPlugin):
         if not stream_id:
             self.ctx.logger.warning("回执缺少 stream_id，已放弃发送: %s", text)
             return
-        sent = await self.ctx.send.text(text, stream_id)
+        # 必须带 return_details：默认形态下 SDK 会把结果塌成 bool(success)，
+        # 真实的 sent 字段被丢掉，于是"发失败"和"发成功"看起来一模一样
+        result = await self.ctx.send.text(text, stream_id, return_details=True)
+        sent = bool(result.get("sent")) if isinstance(result, dict) else bool(result)
         if not sent:
-            self.ctx.logger.error("回执发送失败: stream_id=%s text=%s", stream_id, text)
+            self.ctx.logger.error("回执发送失败: stream_id=%s text=%s result=%r", stream_id, text, result)
 
 
 def _split_owner(entry: str) -> Optional[Tuple[str, str]]:

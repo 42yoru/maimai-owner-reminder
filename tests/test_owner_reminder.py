@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
 
 import importlib.util
@@ -1597,6 +1598,23 @@ class AliasAndToolTestCase(PluginTestCase):
         self.assertIn(BOT_NICKNAME, note)
         self.assertIn("config.get", self.host.capability_calls)
         self.assertEqual(self.host.config_calls[0]["key"], "bot.nickname")
+
+    async def test_receipt_send_failure_is_reported(self, ) -> None:
+        """回执发不出去要留痕：send.text 默认会把结果塌成 bool(success)，必须显式要 sent。"""
+
+        plugin = await self.build_plugin()
+        calls: List[Dict[str, Any]] = []
+
+        async def fake_send(*args: Any, **kwargs: Any) -> Any:
+            calls.append({"args": args, **kwargs})
+            return {"sent": False, "message_id": None}
+
+        plugin.ctx.send = SimpleNamespace(text=fake_send)  # type: ignore[assignment]
+        with self.assertLogs(plugin.ctx.logger, level="ERROR") as captured:
+            await plugin._send(ISSUER_SESSION, "回执内容")
+
+        self.assertIn("回执发送失败", "".join(captured.output))
+        self.assertTrue(calls and calls[0].get("return_details") is True)
 
     async def test_private_streams_shape_error_is_raised(self) -> None:
         """私聊流能力返回形状不对时抛错：代号对照表会整块消失，不能只留一句 warning。"""
