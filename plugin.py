@@ -71,7 +71,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.6", description="配置版本")
+    config_version: str = Field(default="0.4.7", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -1055,14 +1055,25 @@ class OwnerReminderPlugin(MaiBotPlugin):
         # 模板写坏（多了个未知占位符）就在这里抛 KeyError，由调用方转成「提醒投递出错」的回执：
         # 宁可让主人看到一次明确的配置错误，也不要静默发一条没有叮嘱内容的 intent 过去。
         intent = self.config.dispatch.intent_template.format(内容=reminder.content)
-        result = await self.ctx.maisaka.proactive.trigger(
-            stream_id=reminder.target_session_id,
-            intent=intent,
-            reason="主人下达了叮嘱",
-        )
+        # 先记「投递过」再真正投递：proactive.trigger 只是入队并唤醒目标流，目标流那一轮的
+        # planner→reply 完全可能在这次 await 返回之前就跑完；那时 consume_dispatched 因为
+        # dispatched_at 还是 0 而认不出这是「兑现」，叮嘱会一直留到 TTL，期间每轮 planner
+        # 继续被注入「主人刚特意交代过」——已经照做了却还在施压。
+        self.store.mark_dispatched(reminder.id, time.time())
+        try:
+            result = await self.ctx.maisaka.proactive.trigger(
+                stream_id=reminder.target_session_id,
+                intent=intent,
+                reason="主人下达了叮嘱",
+            )
+        except Exception:
+            # 投递本身炸了：撤销记账，退回纯 TTL 语义，别让这条叮嘱永远等不到「兑现」
+            self.store.clear_dispatched(reminder.id)
+            raise
         if not isinstance(result, dict) or not result.get("success"):
             error = result.get("error") if isinstance(result, dict) else repr(result)
             self.ctx.logger.error("朝目标流投递提醒失败: %s", error)
+            self.store.clear_dispatched(reminder.id)
             return f"⚠️ 但提醒没投出去（{error}）：叮嘱已保存，会在目标流下次自然触发时生效。"
 
         self.ctx.logger.info(
@@ -1070,8 +1081,6 @@ class OwnerReminderPlugin(MaiBotPlugin):
             reminder.target_session_id,
             result.get("task_id"),
         )
-        # 记下"投递过"：之后她一旦在这个目标流真的开口，这条叮嘱就该被消费掉
-        self.store.mark_dispatched(reminder.id, time.time())
         return "已提醒她自己去判断要不要现在处理。"
 
     async def _send(self, stream_id: str, text: str) -> None:

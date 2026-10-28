@@ -180,6 +180,16 @@ class ReminderStore:
         except OSError as exc:
             raise ReminderStoreError(f"写入叮嘱状态文件失败: {self.path}: {exc}") from exc
 
+    def _commit(self, candidate: List[Reminder]) -> None:
+        """先原子写盘，成功后才切换内存状态。
+
+        写失败时内存必须保持旧值：回执说「没保存」就真的要没保存，否则磁盘满 / 权限错误之后，
+        那条叮嘱仍会被注入目标流，下一次任意成功写盘还会把它持久化。
+        """
+
+        self._write_file(candidate)
+        self._reminders = candidate
+
     # ──── 查询 ────
 
     def active_for(self, session_id: str, now: float) -> List[Reminder]:
@@ -207,8 +217,7 @@ class ReminderStore:
         expired = [item for item in reminders if item.stage(now, self._strong_ratio) == "expired"]
         if expired:
             expired_ids = {item.id for item in expired}
-            self._reminders = [item for item in reminders if item.id not in expired_ids]
-            self._write_file(self._reminders)
+            self._commit([item for item in reminders if item.id not in expired_ids])
         return expired
 
     # ──── 写入 ────
@@ -252,9 +261,9 @@ class ReminderStore:
         evicted = same_target[:overflow]
         evicted_ids = {item.id for item in evicted}
 
-        self._reminders = [item for item in reminders if item.id not in evicted_ids]
-        self._reminders.append(reminder)
-        self._write_file(self._reminders)
+        remaining = [item for item in reminders if item.id not in evicted_ids]
+        remaining.append(reminder)
+        self._commit(remaining)
         return reminder, evicted
 
     # ──── 投递与消费 ────
@@ -274,12 +283,27 @@ class ReminderStore:
             if item.id != reminder_id:
                 continue
             updated = replace(item, dispatched_at=now)
-            self._reminders = [
-                updated if candidate.id == item.id else candidate for candidate in self._ensure_loaded()
-            ]
-            self._write_file(self._reminders)
+            self._commit([updated if candidate.id == item.id else candidate for candidate in self._ensure_loaded()])
             return updated
         return None
+
+    def clear_dispatched(self, reminder_id: str) -> None:
+        """撤销「已投递」标记，让条目回到纯 TTL 语义。
+
+        投递失败时用它回滚：`proactive.trigger` 没成功就说明目标流根本没被惊动，
+        这条叮嘱不该被后续任何一次开口"兑现"掉。
+        """
+
+        for item in self._ensure_loaded():
+            if item.id != reminder_id or not item.dispatched:
+                continue
+            self._commit(
+                [
+                    replace(candidate, dispatched_at=0.0) if candidate.id == item.id else candidate
+                    for candidate in self._ensure_loaded()
+                ]
+            )
+            return
 
     def consume_dispatched(self, session_id: str, now: float) -> List[Reminder]:
         """消费掉目标流里已经投递过的叮嘱：她已经在那个聊天流说过话了。
@@ -299,8 +323,7 @@ class ReminderStore:
         if not hits:
             return []
         consumed_ids = {item.id for item in hits}
-        self._reminders = [item for item in reminders if item.id not in consumed_ids]
-        self._write_file(self._reminders)
+        self._commit([item for item in reminders if item.id not in consumed_ids])
         return hits
 
     def revoke(self, reminder_id: str, now: float) -> Optional[Reminder]:
@@ -311,8 +334,7 @@ class ReminderStore:
         for item in self._ensure_loaded():
             if item.id != normalized_id:
                 continue
-            self._reminders = [candidate for candidate in self._ensure_loaded() if candidate.id != item.id]
-            self._write_file(self._reminders)
+            self._commit([candidate for candidate in self._ensure_loaded() if candidate.id != item.id])
             return item
         return None
 
@@ -322,8 +344,7 @@ class ReminderStore:
         self.purge_expired(now)
         removed = list(self._ensure_loaded())
         if removed:
-            self._reminders = []
-            self._write_file(self._reminders)
+            self._commit([])
         return removed
 
     @staticmethod

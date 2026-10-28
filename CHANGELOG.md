@@ -1,5 +1,23 @@
 # 更新记录
 
+## 0.4.7
+
+**修复**
+
+- **「兑现即消费」会被竞态绕过**：`mark_dispatched` 原来落在 `await proactive.trigger` 之后。
+  `trigger` 只是入队并唤醒目标流，那一轮的 planner→reply 完全可能先跑完，此时
+  `dispatched_at` 还是 0，`consume_dispatched` 认为"没投递过"而跳过，于是叮嘱一直留到 TTL，
+  期间每轮 planner 继续被注入「主人刚特意交代过」——已经照做了却还在施压。
+  现在先记账再投递，投递失败 / 抛错时用新增的 `clear_dispatched` 回滚回纯 TTL 语义
+- **状态先改内存再写盘**：`create` / `purge_expired` / `mark_dispatched` / `consume_dispatched` /
+  `revoke` / `revoke_all` 以及 `AliasStore.set/remove` 全部改成「先原子写盘、成功后才切内存」
+  （`_commit`）。之前磁盘满或权限错误时，回执说「❌ 叮嘱没能保存」，但那条叮嘱已经在内存里，
+  下一轮目标流 planner 照样被注入，且后续任意一次成功写盘还会把它持久化
+
+**细节**
+
+- 测试 155 → 158：新增「写盘失败时内存与磁盘都不变」「目标流在 trigger 返回前回复也要算兑现」两条
+
 ## 0.4.6
 
 **主要功能**

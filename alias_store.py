@@ -196,9 +196,14 @@ class AliasStore:
         )
         folded = normalized_name.casefold()
         kept = [item for item in self._ensure_loaded() if item.name.casefold() != folded]
-        self._aliases = [*kept, alias]
-        self._write_file(self._aliases)
+        self._commit([*kept, alias])
         return alias
+
+    def _commit(self, candidate: List[ChatAlias]) -> None:
+        """先原子写盘，成功后才切换内存状态（口径与 ReminderStore._commit 一致）。"""
+
+        self._write_file(candidate)
+        self._aliases = candidate
 
     def remove(self, name: str) -> Optional[ChatAlias]:
         """删除一个代号；不存在时返回 None。"""
@@ -207,6 +212,5 @@ class AliasStore:
         if target is None:
             return None
         folded = target.name.casefold()
-        self._aliases = [item for item in self._ensure_loaded() if item.name.casefold() != folded]
-        self._write_file(self._aliases)
+        self._commit([item for item in self._ensure_loaded() if item.name.casefold() != folded])
         return target

@@ -109,6 +109,8 @@ class FakeHost:
         self.recent_error: Optional[str] = None
         self.sent: List[Tuple[str, str]] = []
         self.proactive_calls: List[Dict[str, Any]] = []
+        # 可选：在 maisaka.proactive.trigger 执行期间触发的副作用，用来模拟目标流抢先回复
+        self.on_proactive: Optional[Any] = None
         self.proactive_result: Dict[str, Any] = {
             "success": True,
             "queued": True,
@@ -144,6 +146,8 @@ class FakeHost:
             return {"success": True, "sent": True, "message_id": "m1"}
         if capability == "maisaka.proactive.trigger":
             self.proactive_calls.append(dict(args))
+            if self.on_proactive is not None:
+                await self.on_proactive()
             return self.proactive_result
         if capability == "config.get":
             self.config_calls.append(dict(args))
@@ -351,6 +355,25 @@ class PluginTestCase(IsolatedAsyncioTestCase):
         self.assertFalse(self.store_path().exists())
 
     # ──── 兑现即消费 ────
+
+    async def test_reply_racing_the_trigger_is_still_consumed(self) -> None:
+        """目标流在 proactive.trigger 返回之前就回复，也要算「兑现」。
+
+        trigger 只是入队并唤醒目标流，那一轮的 planner→reply 完全可能先跑完。如果记账发生在
+        await 之后，consume_dispatched 会认为"没投递过"而跳过，这条叮嘱就一直留到 TTL，
+        期间每轮 planner 继续被注入「主人刚特意交代过」。
+        """
+
+        plugin = await self.build_plugin()
+
+        async def reply_during_trigger() -> None:
+            await plugin.consume_after_reply(session_id=TARGET_SESSION)
+
+        self.host.on_proactive = reply_during_trigger
+
+        await plugin.handle_owner_reminder(**self.command_kwargs(f"{GROUP_ID} 别吵了"))
+
+        self.assertEqual(plugin.store.active_for(TARGET_SESSION, time.time()), [])
 
     async def test_dispatch_marks_reminder_dispatched(self) -> None:
         """投递成功要在状态里记下"投递过"，这是之后能被消费的前提。"""
@@ -1054,6 +1077,30 @@ class StoreTestCase(TestCase):
         self.assertEqual(reminder.stage(created + 198.0, 0.33), "weak")
         self.assertEqual(reminder.stage(created + 599.9, 0.33), "weak")
         self.assertEqual(reminder.stage(created + 600.0, 0.33), "expired")
+
+    def test_write_failure_keeps_memory_unchanged(self) -> None:
+        """写盘失败时内存必须保持旧值。
+
+        回执说「没保存」就真的要没保存：否则磁盘满 / 权限错误之后，那条叮嘱仍会留在内存里
+        继续注入目标流，下一次任意成功写盘还会把它持久化。
+        """
+
+        first = self._create(now=1000.0, content="第一条")
+        original = self.store._write_file
+
+        def boom(_items: Any) -> None:
+            raise STORE_MODULE.ReminderStoreError("磁盘满")
+
+        self.store._write_file = boom  # type: ignore[assignment]
+        try:
+            with self.assertRaises(STORE_MODULE.ReminderStoreError):
+                self._create(now=1001.0, content="第二条")
+        finally:
+            self.store._write_file = original  # type: ignore[assignment]
+
+        self.assertEqual([item.id for item in self.store.active_all(1002.0)], [first.id])
+        reopened = STORE_MODULE.ReminderStore(Path(self._tmp.name), max_per_target=3, strong_ratio=0.33)
+        self.assertEqual([item.content for item in reopened.active_all(1002.0)], ["第一条"])
 
     def test_purge_and_active(self) -> None:
         """到期条目被清除，未到期条目保留。"""
