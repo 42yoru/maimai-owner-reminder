@@ -913,7 +913,8 @@ class CommandComponentTestCase(TestCase):
         self.assertIn("owner_reminder_consume", hook_metadata)
         consume_metadata = hook_metadata["owner_reminder_consume"]
         self.assertEqual(consume_metadata["hook"], "maisaka.reply.before_post_process")
-        self.assertEqual(consume_metadata["mode"], "blocking")
+        # 它不改 kwargs、也不需要拦消息，OBSERVE 就够；BLOCKING 会把发送链路挂在它的超时上
+        self.assertEqual(consume_metadata["mode"], "observe")
 
     def test_tools_are_declared_private_scoped(self) -> None:
         """两个自然语言工具都必须把 chat_scope=private 暴露在**顶层**。
@@ -1615,6 +1616,23 @@ class AliasAndToolTestCase(PluginTestCase):
 
         self.assertIn("回执发送失败", "".join(captured.output))
         self.assertTrue(calls and calls[0].get("return_details") is True)
+
+    def test_manifest_capabilities_match_usage(self) -> None:
+        """manifest 声明的能力必须与实际调用一一对应：多声明和漏声明都算错。"""
+
+        declared = set(_MANIFEST["capabilities"])
+
+        self.assertEqual(
+            declared,
+            {
+                "chat.get_group_streams",
+                "chat.get_private_streams",
+                "config.get",
+                "maisaka.proactive.trigger",
+                "message.get_recent",
+                "send.text",
+            },
+        )
 
     async def test_private_streams_shape_error_is_raised(self) -> None:
         """私聊流能力返回形状不对时抛错：代号对照表会整块消失，不能只留一句 warning。"""

@@ -72,7 +72,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.10", description="配置版本")
+    config_version: str = Field(default="0.4.11", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -238,11 +238,6 @@ class OwnerReminderPlugin(MaiBotPlugin):
             chat_scope = str(metadata.get("chat_scope") or "").strip()
             if chat_scope and "chat_scope" not in component:
                 component["chat_scope"] = chat_scope
-            allowed_session = metadata.get("allowed_session")
-            if isinstance(allowed_session, list) and "allowed_session" not in component:
-                component["allowed_session"] = [
-                    str(item).strip() for item in allowed_session if str(item).strip()
-                ]
         return components
 
     # ──── 生命周期 ────
@@ -252,11 +247,14 @@ class OwnerReminderPlugin(MaiBotPlugin):
 
         self._store = self._build_store()
         self._alias_store = AliasStore(self.ctx.paths.data_dir)
+        # 主动读一次状态文件：坏文件在这里就暴露（而不是等第一条叮嘱进来才发现）。
+        # 别让它只是格式化日志的副作用——那样"读状态"这件事就没有明确责任人了。
+        active_count = len(self._store.active_all(time.time()))
         await self._refresh_owner_sessions()
         await self._refresh_bot_nickname()
         self.ctx.logger.info(
             "主人的叮嘱已加载: 生效中=%s 条, 代号=%s 个, 主人的私聊=%s, 投递模式=%s, 昵称=%s",
-            len(self._store.active_all(time.time())),
+            active_count,
             len(self._alias_store.all()),
             sorted(self._owner_sessions),
             self.config.dispatch.mode,
@@ -397,7 +395,9 @@ class OwnerReminderPlugin(MaiBotPlugin):
         "maisaka.reply.before_post_process",
         name="owner_reminder_consume",
         description="目标流即将发出可见回复时，消费掉已经投递过提醒的叮嘱。",
-        mode=HookMode.BLOCKING,
+        # 它不改任何 kwargs、也不需要拦下消息，用 OBSERVE 就够了；
+        # BLOCKING 会跟着把整条发送链路挂在自己的超时上
+        mode=HookMode.OBSERVE,
         order=HookOrder.LATE,
         timeout_ms=3000,
         error_policy=ErrorPolicy.SKIP,
@@ -1028,7 +1028,9 @@ class OwnerReminderPlugin(MaiBotPlugin):
                 now=time.time(),
             )
         except ReminderStoreError as exc:
-            self.ctx.logger.error("保存叮嘱失败: %s", exc)
+            # 只兜「状态文件写不进去」这一种；其它异常（编程错误、契约漂移）照常往上抛，
+            # 不然它们会被伪装成"提醒投递出错"这种看起来像业务规则的提示
+            self.ctx.logger.error("保存叮嘱失败: %s", exc, exc_info=True)
             return None, build_error_text(f"叮嘱没能保存：{exc}")
 
         try:

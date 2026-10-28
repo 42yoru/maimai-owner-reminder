@@ -1,5 +1,21 @@
 # 更新记录
 
+## 0.4.11
+
+**修复**
+
+- **消费 hook 用 BLOCKING 但什么都不改**：`owner_reminder_consume` 不修改任何 kwargs、也不需要拦下
+  消息，BLOCKING 只会把整条发送链路挂在它的超时上。改成 `OBSERVE`
+- **`_apply_directive` 的宽 `except`**：收窄到只兜 `ReminderStoreError`（状态文件写不进去），
+  其它异常照常上抛；保存失败时日志补上堆栈
+
+**细节**
+
+- 删掉 `get_components` 里 `allowed_session` 的死分支（宿主不读这个键）
+- `on_load` 里的状态文件读取从「格式化日志的副作用」改成显式一步：坏文件在这里就暴露，
+  责任明确
+- 测试 160 → 161：新增「manifest 能力声明与实际调用一一对应」的断言
+
 ## 0.4.10
 
 **细节**
