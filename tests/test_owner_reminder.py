@@ -38,6 +38,7 @@ GROUP_ID = "123456789"
 GROUP_NAME = "测试群"
 TARGET_SESSION = "1111222233334444aaaabbbbccccdddd"
 ISSUER_SESSION = "aaaabbbbccccdddd1111222233334444"
+OUTSIDER_SESSION = "9999888877776666aaaabbbbccccdddd"
 OTHER_ACCOUNT = "100000002"
 DUPLICATE_SESSION = "5555666677778888eeeeffff00001111"
 
@@ -92,9 +93,20 @@ class FakeHost:
                 "user_cardname": "",
                 "account_id": "10001",
                 "platform": PLATFORM,
-            }
+            },
+            {
+                # 陌生人的私聊流：用来验证"身份必须由流反查"而不是看调用参数
+                "session_id": OUTSIDER_SESSION,
+                "user_id": NON_OWNER_ID,
+                "user_nickname": "路人",
+                "user_cardname": "",
+                "account_id": "10001",
+                "platform": PLATFORM,
+            },
         ]
         self.group_streams_error: Optional[str] = None
+        self.recent_messages: Dict[str, List[Dict[str, Any]]] = {}
+        self.recent_error: Optional[str] = None
         self.sent: List[Tuple[str, str]] = []
         self.proactive_calls: List[Dict[str, Any]] = []
         self.proactive_result: Dict[str, Any] = {
@@ -136,7 +148,18 @@ class FakeHost:
         if capability == "config.get":
             self.config_calls.append(dict(args))
             return self.config_result
+        if capability == "message.get_recent":
+            if self.recent_error is not None:
+                return {"success": False, "error": self.recent_error}
+            chat_id = str(args.get("chat_id") or "")
+            return {"success": True, "messages": list(self.recent_messages.get(chat_id, []))}
         raise AssertionError(f"未预期的能力调用: {capability}")
+
+    @staticmethod
+    def recent_message(user_id: str) -> Dict[str, Any]:
+        """构造一条 message.get_recent 会返回的消息（只保留身份校验用到的字段）。"""
+
+        return {"message_info": {"user_info": {"user_id": user_id}}}
 
     @property
     def last_receipt(self) -> str:
@@ -191,13 +214,14 @@ class PluginTestCase(IsolatedAsyncioTestCase):
         *,
         user_id: str = OWNER_ID,
         group_id: str = "",
+        stream_id: str = ISSUER_SESSION,
     ) -> Dict[str, Any]:
         """构造命令调用参数，忠实模拟宿主捕获的 ``rest``（带前导空格）。"""
 
         captured_rest = f" {rest}" if rest else ""
         return {
             "text": f"/叮嘱{captured_rest}",
-            "stream_id": ISSUER_SESSION,
+            "stream_id": stream_id,
             "group_id": group_id,
             "platform": PLATFORM,
             "user_id": user_id,
@@ -392,12 +416,20 @@ class PluginTestCase(IsolatedAsyncioTestCase):
         self.assertEqual(len(plugin.store.active_for(TARGET_SESSION, time.time())), 1)
 
     async def test_owner_whitelist_silently_ignores_others(self) -> None:
-        """非主人下达：不回执、不落盘。"""
+        """非主人下达：不回执、不落盘。
+
+        注意这里必须用**别人的**私聊流：身份是按 stream_id 反查出来的，
+        在主人的私聊流里说话的人就是主人本身。
+        """
 
         plugin = await self.build_plugin()
 
         success, _, intercept = await plugin.handle_owner_reminder(
-            **self.command_kwargs(f"{GROUP_ID} 别吵了", user_id=NON_OWNER_ID)
+            **self.command_kwargs(
+                f"{GROUP_ID} 别吵了",
+                user_id=NON_OWNER_ID,
+                stream_id=OUTSIDER_SESSION,
+            )
         )
 
         self.assertFalse(success)
@@ -1334,7 +1366,7 @@ class AliasAndToolTestCase(PluginTestCase):
         """非主人调用两个工具：一律拒绝且不落盘。"""
 
         plugin = await self.build_plugin()
-        outsider = self.tool_kwargs(user_id=NON_OWNER_ID)
+        outsider = self.tool_kwargs(user_id=NON_OWNER_ID, stream_id=OUTSIDER_SESSION)
 
         directive = await plugin.handle_owner_directive(content="别吵了", chat=GROUP_ID, **outsider)
         alias = await plugin.handle_owner_chat_alias(
@@ -1600,22 +1632,66 @@ class AliasAndToolTestCase(PluginTestCase):
 
         self.assertEqual(plugin._configured_owners(), [OWNER])
 
-    async def test_owner_session_learned_from_tool_call(self) -> None:
-        """加载时解析不到主人私聊也没关系：调用一次工具就自我补全。"""
+    async def test_identity_cannot_be_spoofed_in_group_stream(self) -> None:
+        """群里冒充主人：声明的 user_id 是主人，但那个号没在这个群说过话 → 拒绝。"""
+
+        plugin = await self.build_plugin()
+        self.host.recent_messages[TARGET_SESSION] = [self.host.recent_message(NON_OWNER_ID)]
+
+        result = await plugin.handle_owner_directive(
+            content="别吵了",
+            chat=GROUP_ID,
+            **self.tool_kwargs(user_id=OWNER_ID, stream_id=TARGET_SESSION, group_id=GROUP_ID),
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["content"], "没有权限执行该操作。")
+        self.assertFalse(self.store_path().exists())
+
+    async def test_group_tool_allowed_when_owner_recently_spoke(self) -> None:
+        """群里主人刚说过话：声明身份被最近消息印证，正常放行。"""
+
+        plugin = await self.build_plugin()
+        self.host.recent_messages[TARGET_SESSION] = [
+            self.host.recent_message(NON_OWNER_ID),
+            self.host.recent_message(OWNER_ID),
+        ]
+
+        result = await plugin.handle_owner_directive(
+            content="别吵了",
+            chat=GROUP_ID,
+            **self.tool_kwargs(user_id=OWNER_ID, stream_id=TARGET_SESSION, group_id=GROUP_ID),
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertTrue(self.store_path().exists())
+
+    async def test_unverifiable_identity_refuses_and_learns_nothing(self) -> None:
+        """身份反查不到时：拒绝，且不会把该流记进代号注入范围。"""
 
         self.host.private_streams = []
         plugin = await self.build_plugin()
-        await plugin.handle_owner_chat_alias(
+
+        result = await plugin.handle_owner_chat_alias(
             action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
         )
-        items = self.sample_items()
 
-        result = await plugin.inject_owner_reminder(
-            session_id=ISSUER_SESSION, items=items, item_schema_version=1
-        )
+        self.assertFalse(result["success"])
+        self.assertEqual(plugin._owner_sessions, set())
+        self.assertFalse((self.tmp_dir / "aliases.json").exists())
 
-        self.assertEqual(len(result["modified_kwargs"]["items"]), len(items) + 1)
-        self.assertIn("群代号", result["modified_kwargs"]["items"][-1]["parts"][0]["text"])
+    async def test_private_stream_lookup_failure_is_raised(self) -> None:
+        """能力返回形状不对时直接抛错，不静默降级成"查不到"。"""
+
+        plugin = await self.build_plugin()
+        self.host.private_streams = "broken"  # type: ignore[assignment]
+
+        with self.assertRaises(RuntimeError):
+            await plugin.handle_owner_directive(
+                content="别吵了",
+                chat=GROUP_ID,
+                **self.tool_kwargs(),
+            )
 
     async def test_directive_and_owner_note_are_separate_items(self) -> None:
         """目标流拿叮嘱，主人私聊拿对照表，互不串台。"""

@@ -59,6 +59,9 @@ ALIAS_ACTION_LIST = ("", "list", "ls", "列表", "查看")
 ALIAS_ACTION_SET = ("set", "add", "设置", "新增")
 ALIAS_ACTION_REMOVE = ("remove", "delete", "del", "删除")
 
+IDENTITY_RECENT_SCAN = 50
+"""群聊流核对声明身份时回看的消息条数；只用于身份核验，与叮嘱内容无关。"""
+
 
 class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
@@ -68,7 +71,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.5", description="配置版本")
+    config_version: str = Field(default="0.4.6", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -484,11 +487,14 @@ class OwnerReminderPlugin(MaiBotPlugin):
             return False, None, 1
 
         context = self._invocation_context(kwargs)
-        if not self._is_owner(context["platform"], context["user_id"]):
+        identity = await self._resolve_owner_identity(context)
+        if not self._is_owner_identity(identity):
             self.ctx.logger.info(
-                "非主人使用叮嘱命令，已静默忽略: platform=%s user_id=%s",
+                "非主人使用叮嘱命令，已静默忽略: 声明=%s:%s 反查=%s stream=%s",
                 context["platform"],
                 context["user_id"],
+                identity or "<无法确认>",
+                context["stream_id"],
             )
             return False, None, 1
 
@@ -511,13 +517,14 @@ class OwnerReminderPlugin(MaiBotPlugin):
             await self._send(context["stream_id"], build_usage_text(request.error))
             return False, None, 1
 
-        return await self._handle_set(request, context=context)
+        return await self._handle_set(request, context=context, identity=identity)
 
     async def _handle_set(
         self,
         request: CommandRequest,
         *,
         context: Dict[str, str],
+        identity: str,
     ) -> Tuple[bool, Optional[str], int]:
         """下达一条叮嘱：解析目标、落盘、投递提醒并回执。"""
 
@@ -531,7 +538,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
             )
             return False, None, 1
 
-        self._remember_owner_session(context)
+        self._remember_owner_session(context, identity)
         resolved = await self._resolve_target_with_alias(
             request.target_group_id,
             context=context,
@@ -617,14 +624,17 @@ class OwnerReminderPlugin(MaiBotPlugin):
         """自然语言下达：由她自己的 planner 调用，落到与 ``/叮嘱`` 完全相同的链路。"""
 
         context = self._invocation_context(kwargs)
-        if not self._is_owner(context["platform"], context["user_id"]):
+        identity = await self._resolve_owner_identity(context)
+        if not self._is_owner_identity(identity):
             self.ctx.logger.info(
-                "非主人调用 owner_directive，已拒绝: platform=%s user_id=%s",
+                "非主人调用 owner_directive，已拒绝: 声明=%s:%s 反查=%s stream=%s",
                 context["platform"],
                 context["user_id"],
+                identity or "<无法确认>",
+                context["stream_id"],
             )
             return {"success": False, "content": build_not_owner_text()}
-        self._remember_owner_session(context)
+        self._remember_owner_session(context, identity)
 
         if not self.config.plugin.enabled or not self.config.tool.enabled:
             return {"success": False, "content": build_tool_disabled_text()}
@@ -694,14 +704,17 @@ class OwnerReminderPlugin(MaiBotPlugin):
         """群代号的增删查。"""
 
         context = self._invocation_context(kwargs)
-        if not self._is_owner(context["platform"], context["user_id"]):
+        identity = await self._resolve_owner_identity(context)
+        if not self._is_owner_identity(identity):
             self.ctx.logger.info(
-                "非主人调用 owner_chat_alias，已拒绝: platform=%s user_id=%s",
+                "非主人调用 owner_chat_alias，已拒绝: 声明=%s:%s 反查=%s stream=%s",
                 context["platform"],
                 context["user_id"],
+                identity or "<无法确认>",
+                context["stream_id"],
             )
             return {"success": False, "content": build_not_owner_text()}
-        self._remember_owner_session(context)
+        self._remember_owner_session(context, identity)
 
         if not self.config.plugin.enabled or not self.config.tool.enabled:
             return {"success": False, "content": build_tool_disabled_text()}
@@ -762,7 +775,12 @@ class OwnerReminderPlugin(MaiBotPlugin):
 
     @staticmethod
     def _invocation_context(kwargs: Dict[str, Any]) -> Dict[str, str]:
-        """从命令 / 工具调用参数里取出通用上下文。"""
+        """从命令 / 工具调用参数里取出通用上下文。
+
+        注意：``user_id`` / ``platform`` 只是调用方**声明**的值，工具通道里模型可以
+        自己填（宿主合并上下文时"模型给了就不覆盖"），所以它们不能当身份凭据，
+        一律交给 :meth:`_resolve_owner_identity` 反查。
+        """
 
         return {
             "stream_id": str(kwargs.get("stream_id") or "").strip(),
@@ -771,26 +789,81 @@ class OwnerReminderPlugin(MaiBotPlugin):
             "group_id": str(kwargs.get("group_id") or "").strip(),
         }
 
-    def _is_owner(self, platform: str, user_id: str) -> bool:
-        """判断调用者是否在主人白名单里。"""
+    def _owner_identities(self) -> Set[str]:
+        """主人白名单，形如 ``{"qq:100000001"}``。"""
 
-        if not platform or not user_id:
-            return False
-        identity = f"{platform}:{user_id}"
-        allowed = {item.strip() for item in self.config.owner.owners if item.strip()}
-        return identity in allowed
+        return {item.strip() for item in self.config.owner.owners if item.strip()}
+
+    def _is_owner_identity(self, identity: str) -> bool:
+        """判断一个**已反查出来**的身份是否在主人白名单里。"""
+
+        return bool(identity) and identity in self._owner_identities()
+
+    async def _resolve_owner_identity(self, context: Dict[str, str]) -> str:
+        """反查调用者的真实身份，返回 ``platform:user_id``；确认不了返回空串。
+
+        为什么不直接信 ``kwargs["user_id"]``：宿主的插件工具通道
+        （``component_query._build_tool_invocation_payload``）在合并上下文时只在
+        "模型没给这个键"的情况下才注入真实值，模型只要在工具参数里塞一个
+        ``user_id`` 就能冒充主人。所以身份必须从宿主侧的数据反查：
+
+        - **私聊流**：``chat.get_private_streams`` 里 ``session_id`` 命中的那条私聊
+          流的 ``user_id`` 就是调用者，模型伪造不了。
+        - **群聊流**：SDK 拿不到"这条消息是谁发的"，退化为核对声明的账号确实在这个
+          流最近说过话；核对不到一律拒绝（宁可让主人改用 ``/叮嘱``，也不放行
+          一个无法确认的身份）。彻底修复需要宿主无条件覆盖身份字段，见 README
+          "身份校验"一节。
+
+        能力返回形状不对时直接抛错，不降级成"查不到"。
+        """
+
+        stream_id = context["stream_id"]
+        platform = context["platform"]
+        if not stream_id or not platform:
+            return ""
+
+        streams = await self.ctx.chat.get_private_streams(platform)
+        if not isinstance(streams, list):
+            raise RuntimeError(f"chat.get_private_streams 返回异常，无法校验身份: {streams!r}")
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            if str(stream.get("session_id") or "").strip() != stream_id:
+                continue
+            user_id = str(stream.get("user_id") or "").strip()
+            return f"{platform}:{user_id}" if user_id else ""
+
+        # 不是私聊流：只能核对声明的账号是否真的在这个流里说过话
+        claimed = context["user_id"]
+        if not claimed:
+            return ""
+        recent = await self.ctx.message.get_recent(stream_id, limit=IDENTITY_RECENT_SCAN)
+        if not isinstance(recent, list):
+            raise RuntimeError(f"message.get_recent 返回异常，无法校验身份: {recent!r}")
+        for item in recent:
+            if not isinstance(item, dict):
+                continue
+            message_info = item.get("message_info")
+            if not isinstance(message_info, dict):
+                continue
+            user_info = message_info.get("user_info")
+            if not isinstance(user_info, dict):
+                continue
+            if str(user_info.get("user_id") or "").strip() == claimed:
+                return f"{platform}:{claimed}"
+        return ""
 
     def _is_registered_alias(self, token: str) -> bool:
         """判断一个 token 是否是已登记的群代号（供命令解析使用）。"""
 
         return self.alias_store.find(token) is not None
 
-    def _remember_owner_session(self, context: Dict[str, str]) -> None:
+    def _remember_owner_session(self, context: Dict[str, str], identity: str) -> None:
         """把主人的私聊会话记下来，供 hook 注入代号表使用。"""
 
         if context["group_id"] or not context["stream_id"]:
             return
-        if not self._is_owner(context["platform"], context["user_id"]):
+        if not self._is_owner_identity(identity):
             return
         self._owner_sessions.add(context["stream_id"])
 

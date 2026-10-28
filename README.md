@@ -4,7 +4,7 @@
   <a href="https://github.com/42yoru/maimai-owner-reminder/actions/workflows/ci.yml"><img src="https://github.com/42yoru/maimai-owner-reminder/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://github.com/Mai-with-u/MaiBot"><img src="https://img.shields.io/badge/MaiBot-1.3.9%2B-orange.svg" alt="MaiBot"></a>
-  <a href="https://github.com/Mai-with-u/maibot-plugin-sdk"><img src="https://img.shields.io/badge/SDK-2.14.0%2B-green.svg" alt="SDK"></a>
+  <a href="https://github.com/Mai-with-u/maibot-plugin-sdk"><img src="https://img.shields.io/badge/SDK-2.12.0%2B-green.svg" alt="SDK"></a>
   <img src="https://img.shields.io/badge/python-3.12%2B-blue.svg" alt="Python">
 </p>
 
@@ -44,6 +44,13 @@
 ### 1. 只有白名单里的人算"主人"
 
 `[owner] owners` 里填 `platform:user_id`（例如 `qq:123456789`，英文冒号；写成全角冒号会一直匹配不上，加载时会在日志里点名）。名单外的人下达命令一律**静默忽略**——不提示、不回执，也不会留下记录；模型误调工具时则得到一句中性的「没有权限执行该操作。」，让那一轮对话能自然收住。
+
+**身份是反查出来的，不是看调用参数。** 宿主把工具参数交给插件时，只在这个键"模型没填"的情况下才注入真实上下文，所以模型完全可以在工具参数里塞一个 `user_id` 冒充主人。插件的做法是：
+
+- **私聊**：拿 `stream_id` 去 `chat.get_private_streams` 里找那条私聊流，流的 `user_id` 就是调用者。别人冒充不了自己的私聊流。
+- **群聊**：SDK 拿不到"这条消息是谁发的"，于是退化为核对声明的账号确实在这个流最近 50 条消息里说过话；核对不到就**拒绝**，并让主人改用 `/叮嘱`（命令通道的身份由宿主从真实消息里如实注入，不受影响）。
+
+这层是自保，不是根治：要真正关掉群聊里的冒名空间，需要宿主把 `stream_id` / `group_id` / `user_id` / `platform` 改成无条件覆盖（和它对 `_file_scope` 的做法一致）。
 
 ### 2. 叮嘱作用于「另一个」聊天流
 
@@ -208,6 +215,8 @@ owners = ["qq:你的QQ号"]
 - **目标解析要求明确**：多命中时直接报错，不会自己挑一条；配了 `target.account_id` 就一律要求账号一致。
 - **时间用的是系统墙钟**：把系统时间往回调会让 TTL 被动延长、档位回到「强」。不影响正确性，但别拿它当秒表。
 - **状态文件坏了会明确报错**：`reminders.json` / `aliases.json` 不是合法 JSON、版本不符或缺字段时，插件加载会失败并在日志里说清楚。真坏了删掉对应文件即可——叮嘱本来就有时效，清空不心疼。
+- **群聊里的自然语言工具需要"主人刚说过话"**：身份反查在群聊只能靠最近 50 条消息印证。主人很久没在那个群发言时，`owner_directive` 会被拒绝（日志里会写「反查=<无法确认>」），这时改用 `/叮嘱` 即可。
+- **多消耗一个能力**：身份核验会用 `message.get_recent` 读目标流最近 50 条消息（只读 ID 字段，不送模型、不落盘）。
 
 ## 文件结构
 

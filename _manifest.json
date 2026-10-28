@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
-  "version": "0.4.5",
-  "plugin_type": "tool",
+  "version": "0.4.6",
+  "plugin_type": "automation",
   "name": "主人的叮嘱 (Owner Reminder)",
-  "description": "主人在任意聊天流下达一条短期叮嘱，作用于指定的另一个聊天流：以强/弱两档影响该流 planner；投递过提醒的叮嘱在 bot 于目标流开口后立即消费，没兑现的就按 TTL 到期淡出。支持 /叮嘱 命令与自然语言工具，并可用群代号指代群。纯插件实现，不改主程序。",
+  "description": "主人在任意聊天流下达一条短期叮嘱，作用于指定的另一个聊天流：以强/弱两档影响该流 planner；投递过提醒的叮嘱在 bot 于目标流开口后立即消费，没兑现的就按 TTL 到期淡出。支持 /叮嘱 命令与自然语言工具，并可用群代号指代群。调用者身份从真实聊天流反查，不采信模型传入的 user_id。纯插件实现，不改主程序。",
   "display": {
     "icon": {
       "type": "local",
@@ -23,21 +23,23 @@
     "documentation": "https://github.com/42yoru/maimai-owner-reminder/blob/main/README.md",
     "issues": "https://github.com/42yoru/maimai-owner-reminder/issues"
   },
+  "changelog": "CHANGELOG.md",
   "host_application": {
     "min_version": "1.3.9",
     "max_version": "1.3.99"
   },
   "sdk": {
-    "min_version": "2.14.0",
-    "max_version": "2.16.99"
+    "min_version": "2.12.0",
+    "max_version": "2.99.99"
   },
   "dependencies": [],
   "capabilities": [
     "chat.get_group_streams",
     "chat.get_private_streams",
     "config.get",
-    "send.text",
-    "maisaka.proactive.trigger"
+    "maisaka.proactive.trigger",
+    "message.get_recent",
+    "send.text"
   ],
   "i18n": {
     "default_locale": "zh-CN",
