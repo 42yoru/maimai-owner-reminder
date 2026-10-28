@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from uuid import uuid4
 
+import asyncio
 import time
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
@@ -71,7 +72,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.9", description="配置版本")
+    config_version: str = Field(default="0.4.10", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -373,7 +374,9 @@ class OwnerReminderPlugin(MaiBotPlugin):
         strong_ratio = self.config.reminder.strong_ratio
         appended: List[Dict[str, Any]] = [
             self._build_system_item(reminder, reminder.stage(now, strong_ratio))
-            for reminder in self.store.active_for(session_id, now)
+            # 状态文件是同步 JSON 读写，放在 hook 里会直接占住事件循环；
+            # 注入与消费是每条消息都会走到的热路径，必须挪到线程里
+            for reminder in await asyncio.to_thread(self.store.active_for, session_id, now)
         ]
         owner_note = self._build_owner_note(session_id)
         if owner_note is not None:
@@ -417,7 +420,7 @@ class OwnerReminderPlugin(MaiBotPlugin):
             return {"action": "continue"}
 
         try:
-            consumed = self.store.consume_dispatched(session_id, time.time())
+            consumed = await asyncio.to_thread(self.store.consume_dispatched, session_id, time.time())
         except ReminderStoreError as exc:
             # 状态文件出问题时宁可不消费，也不能让一次回复因此失败
             self.ctx.logger.error("消费叮嘱失败: %s", exc)
