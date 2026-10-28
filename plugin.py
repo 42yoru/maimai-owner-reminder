@@ -71,7 +71,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="0.4.7", description="配置版本")
+    config_version: str = Field(default="0.4.8", description="配置版本")
 
 
 class OwnerConfig(PluginConfigBase):
@@ -870,17 +870,19 @@ class OwnerReminderPlugin(MaiBotPlugin):
     async def _refresh_bot_nickname(self) -> None:
         """从宿主配置读 bot 昵称，避免把某个具体的名字写死在插件里。
 
-        读不到就保持空串，调用方会退回中性的「你」，不影响任何功能。
+        读失败或类型不对都直接抛：昵称会进注入文本，悄悄退化成「你」只会让主人以为
+        插件正常，实际语气全变了。`config.get` 出问题（未授权、字段改名）就该当场看见。
         """
 
-        try:
-            # SDK 会把 config.get 的返回值拆包：拿到的是配置值本身，不是 {"success": ..., "value": ...}
-            value = await self.ctx.call_capability("config.get", key="bot.nickname", default="")
-        except Exception as exc:  # noqa: BLE001 - 昵称只影响文案，读不到不该让加载失败
-            self.ctx.logger.warning("读取 bot 昵称失败: %s", exc)
-            self._bot_nickname = ""
-            return
-        self._bot_nickname = value.strip() if isinstance(value, str) else ""
+        # SDK 会把 config.get 的返回值拆包：拿到的是配置值本身，不是 {"success": ..., "value": ...}
+        value = await self.ctx.call_capability("config.get", key="bot.nickname", default="")
+        if not isinstance(value, str):
+            # config.get 失败时 SDK 会把 {"success": False} 的 value(None) 交出来；
+            # 缺 key 的情况宿主会用 default="" 兜住，所以走到这里就是真的出问题了
+            raise TypeError(
+                f"读取 bot.nickname 失败（config.get 可能未授权或字段改名），拿到 {value!r}"
+            )
+        self._bot_nickname = value.strip()
 
     async def _refresh_owner_sessions(self) -> None:
         """按 owner 白名单尽力解析出主人的私聊会话 ID。
@@ -903,8 +905,8 @@ class OwnerReminderPlugin(MaiBotPlugin):
         for platform, user_ids in owners_by_platform.items():
             streams = await self.ctx.chat.get_private_streams(platform)
             if not isinstance(streams, list):
-                self.ctx.logger.warning("读取私聊流返回异常，暂不注入代号表: %r", streams)
-                continue
+                # 形状不对说明能力契约变了/未授权：代号对照表会整块消失，必须当场暴露
+                raise RuntimeError(f"chat.get_private_streams 返回异常，无法刷新主人私聊会话: {streams!r}")
             for stream in streams:
                 if not isinstance(stream, dict):
                     continue

@@ -1,5 +1,22 @@
 # 更新记录
 
+## 0.4.8
+
+**修复**
+
+- **昵称读失败被静默吞掉**：`_refresh_bot_nickname` 原来用 `except Exception` + `isinstance`
+  双重兜底，`config.get` 未授权或字段改名时只留一句 warning，然后把昵称置空、注入文本里的称呼
+  悄悄变成「你」——主人看到的插件"一切正常"，实际语气已经变了。现在读失败或类型不对都直接抛
+- **私聊流能力返回异常只留一句 warning**：`_refresh_owner_sessions` 在形状不对时 `continue`，
+  代价是「群代号对照 + owner_directive 提示」整块不再注入，而日志里只有一行 warning。
+  现在直接抛错，加载期就能看见
+
+**细节**
+
+- 测试 158 → 159：`test_owner_note_falls_back_when_nickname_missing` 反转为
+  `test_nickname_read_failure_is_raised`（原来那条把"悄悄降级"写成了期望），
+  另新增「私聊流形状异常要抛」
+
 ## 0.4.7
 
 **修复**

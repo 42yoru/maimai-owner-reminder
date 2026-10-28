@@ -1598,22 +1598,25 @@ class AliasAndToolTestCase(PluginTestCase):
         self.assertIn("config.get", self.host.capability_calls)
         self.assertEqual(self.host.config_calls[0]["key"], "bot.nickname")
 
-    async def test_owner_note_falls_back_when_nickname_missing(self) -> None:
-        """读不到昵称时退回中性的「你」，不报错也不阻碍加载。"""
+    async def test_private_streams_shape_error_is_raised(self) -> None:
+        """私聊流能力返回形状不对时抛错：代号对照表会整块消失，不能只留一句 warning。"""
+
+        self.host.private_streams = "broken"  # type: ignore[assignment]
+
+        with self.assertRaises(RuntimeError):
+            await self.build_plugin()
+
+    async def test_nickname_read_failure_is_raised(self) -> None:
+        """读不到昵称是硬错误，不能悄悄退化成「你」。
+
+        昵称会进注入文本，悄悄降级只会让主人以为插件正常、其实语气全变了；
+        config.get 未授权或字段改名都应该在加载时当场看见。
+        """
 
         self.host.config_result = {"success": False, "value": None, "error": "配置项不存在"}
-        plugin = await self.build_plugin()
-        await plugin.handle_owner_chat_alias(
-            action="set", alias="技术群", group=GROUP_ID, **self.tool_kwargs()
-        )
 
-        result = await plugin.inject_owner_reminder(
-            session_id=ISSUER_SESSION, items=self.sample_items(), item_schema_version=1
-        )
-
-        note = result["modified_kwargs"]["items"][-1]["parts"][0]["text"]
-        self.assertIn("主人要让你影响别的聊天流", note)
-        self.assertEqual(plugin._bot_nickname, "")
+        with self.assertRaises(TypeError):
+            await self.build_plugin()
 
     async def test_owner_note_absent_without_alias(self) -> None:
         """没有代号时主人私聊也零改动。"""
