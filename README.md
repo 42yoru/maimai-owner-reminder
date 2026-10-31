@@ -129,7 +129,7 @@ cd plugins/maimai_owner_reminder
 python -m unittest discover -s tests -t .
 ```
 
-当前仓库测试覆盖注入结构、TTL、目标解析、`ask`/`silent`、权限、列表/撤销、状态损坏、工具分支、群代号、投递记账与兑现消费，以及 WebUI 配置 schema。提交前也可运行：
+测试覆盖注入结构、TTL、目标解析、`ask`/`silent`、权限、列表/撤销、状态损坏、工具分支、群代号、投递记账与兑现消费，以及 WebUI 配置 schema。
 
 ```bash
 ruff check . --select E,F,W,B --line-length 130
