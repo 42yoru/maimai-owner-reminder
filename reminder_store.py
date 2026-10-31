@@ -12,7 +12,9 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 import json
 import os
+import threading
 import uuid
+from functools import wraps
 
 STORE_FILE_NAME = "reminders.json"
 STORE_VERSION = 1
@@ -91,6 +93,9 @@ class ReminderStore:
         self._max_per_target = max_per_target
         self._strong_ratio = strong_ratio
         self._reminders: Optional[List[Reminder]] = None
+        # Hooks run storage operations in worker threads while commands can write concurrently.
+        # One re-entrant lock covers every read-modify-write transaction in this instance.
+        self._lock = threading.RLock()
 
     @property
     def path(self) -> Path:
@@ -103,9 +108,10 @@ class ReminderStore:
     def _ensure_loaded(self) -> List[Reminder]:
         """惰性读取状态文件。"""
 
-        if self._reminders is None:
-            self._reminders = self._read_file()
-        return self._reminders
+        with self._lock:
+            if self._reminders is None:
+                self._reminders = self._read_file()
+            return self._reminders
 
     def _read_file(self) -> List[Reminder]:
         """读取并严格校验状态文件。"""
@@ -170,7 +176,8 @@ class ReminderStore:
             "version": STORE_VERSION,
             "reminders": [asdict(item) for item in reminders],
         }
-        temp_path = self.path.parent / (self.path.name + ".tmp")
+        # Keep a unique temp path as a second line of defense for overlapping store instances.
+        temp_path = self.path.parent / f"{self.path.name}.{uuid.uuid4().hex}.tmp"
         try:
             temp_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
@@ -193,32 +200,32 @@ class ReminderStore:
     # ──── 查询 ────
 
     def active_for(self, session_id: str, now: float) -> List[Reminder]:
-        """返回某个聊天流当前生效的叮嘱，按创建时间升序。
+        """返回某个聊天流当前生效的叮嘱，按创建时间升序。"""
 
-        顺带清掉过期条目：注入路径每轮都会走到这里，过期记录留久了只会让文件越滚越大。
-        """
-
-        self.purge_expired(now)
-        return sorted(
-            [item for item in self._ensure_loaded() if item.target_session_id == session_id],
-            key=lambda item: item.created_at,
-        )
+        with self._lock:
+            self.purge_expired(now)
+            return sorted(
+                [item for item in self._ensure_loaded() if item.target_session_id == session_id],
+                key=lambda item: item.created_at,
+            )
 
     def active_all(self, now: float) -> List[Reminder]:
-        """返回全部生效中的叮嘱，按创建时间升序。清理口径与 active_for 一致。"""
+        """返回全部生效中的叮嘱，按创建时间升序。"""
 
-        self.purge_expired(now)
-        return sorted(self._ensure_loaded(), key=lambda item: item.created_at)
+        with self._lock:
+            self.purge_expired(now)
+            return sorted(self._ensure_loaded(), key=lambda item: item.created_at)
 
     def purge_expired(self, now: float) -> List[Reminder]:
         """清除已到期条目，返回被清除的条目。"""
 
-        reminders = self._ensure_loaded()
-        expired = [item for item in reminders if item.stage(now, self._strong_ratio) == "expired"]
-        if expired:
-            expired_ids = {item.id for item in expired}
-            self._commit([item for item in reminders if item.id not in expired_ids])
-        return expired
+        with self._lock:
+            reminders = self._ensure_loaded()
+            expired = [item for item in reminders if item.stage(now, self._strong_ratio) == "expired"]
+            if expired:
+                expired_ids = {item.id for item in expired}
+                self._commit([item for item in reminders if item.id not in expired_ids])
+            return expired
 
     # ──── 写入 ────
 
@@ -239,32 +246,33 @@ class ReminderStore:
             Tuple[Reminder, List[Reminder]]: 新叮嘱，以及因为超出同目标上限而被替换掉的旧叮嘱。
         """
 
-        self.purge_expired(now)
-        reminders = self._ensure_loaded()
-        reminder = Reminder(
-            id=self._new_id({item.id for item in reminders}),
-            target_session_id=target_session_id,
-            target_label=target_label,
-            content=content,
-            issuer=issuer,
-            source_session_id=source_session_id,
-            created_at=now,
-            ttl_seconds=float(ttl_seconds),
-        )
+        with self._lock:
+            self.purge_expired(now)
+            reminders = self._ensure_loaded()
+            reminder = Reminder(
+                id=self._new_id({item.id for item in reminders}),
+                target_session_id=target_session_id,
+                target_label=target_label,
+                content=content,
+                issuer=issuer,
+                source_session_id=source_session_id,
+                created_at=now,
+                ttl_seconds=float(ttl_seconds),
+            )
 
-        # 同一目标流超过上限时，按最旧替换，避免 prompt 里堆积过期态度
-        same_target = sorted(
-            (item for item in reminders if item.target_session_id == target_session_id),
-            key=lambda item: item.created_at,
-        )
-        overflow = max(0, len(same_target) - self._max_per_target + 1)
-        evicted = same_target[:overflow]
-        evicted_ids = {item.id for item in evicted}
+            # 同一目标流超过上限时，按最旧替换，避免 prompt 里堆积过期态度
+            same_target = sorted(
+                (item for item in reminders if item.target_session_id == target_session_id),
+                key=lambda item: item.created_at,
+            )
+            overflow = max(0, len(same_target) - self._max_per_target + 1)
+            evicted = same_target[:overflow]
+            evicted_ids = {item.id for item in evicted}
 
-        remaining = [item for item in reminders if item.id not in evicted_ids]
-        remaining.append(reminder)
-        self._commit(remaining)
-        return reminder, evicted
+            remaining = [item for item in reminders if item.id not in evicted_ids]
+            remaining.append(reminder)
+            self._commit(remaining)
+            return reminder, evicted
 
     # ──── 投递与消费 ────
 
@@ -278,14 +286,15 @@ class ReminderStore:
             Optional[Reminder]: 更新后的条目；找不到时返回 None。
         """
 
-        self.purge_expired(now)
-        for item in self._ensure_loaded():
-            if item.id != reminder_id:
-                continue
-            updated = replace(item, dispatched_at=now)
-            self._commit([updated if candidate.id == item.id else candidate for candidate in self._ensure_loaded()])
-            return updated
-        return None
+        with self._lock:
+            self.purge_expired(now)
+            for item in self._ensure_loaded():
+                if item.id != reminder_id:
+                    continue
+                updated = replace(item, dispatched_at=now)
+                self._commit([updated if candidate.id == item.id else candidate for candidate in self._ensure_loaded()])
+                return updated
+            return None
 
     def clear_dispatched(self, reminder_id: str) -> None:
         """撤销「已投递」标记，让条目回到纯 TTL 语义。
@@ -294,16 +303,17 @@ class ReminderStore:
         这条叮嘱不该被后续任何一次开口"兑现"掉。
         """
 
-        for item in self._ensure_loaded():
-            if item.id != reminder_id or not item.dispatched:
-                continue
-            self._commit(
-                [
-                    replace(candidate, dispatched_at=0.0) if candidate.id == item.id else candidate
-                    for candidate in self._ensure_loaded()
-                ]
-            )
-            return
+        with self._lock:
+            for item in self._ensure_loaded():
+                if item.id != reminder_id or not item.dispatched:
+                    continue
+                self._commit(
+                    [
+                        replace(candidate, dispatched_at=0.0) if candidate.id == item.id else candidate
+                        for candidate in self._ensure_loaded()
+                    ]
+                )
+                return
 
     def consume_dispatched(self, session_id: str, now: float) -> List[Reminder]:
         """消费掉目标流里已经投递过的叮嘱：她已经在那个聊天流说过话了。
@@ -317,35 +327,38 @@ class ReminderStore:
             List[Reminder]: 被消费掉的条目；没有可消费条目时不写盘。
         """
 
-        self.purge_expired(now)
-        reminders = self._ensure_loaded()
-        hits = [item for item in reminders if item.target_session_id == session_id and item.dispatched]
-        if not hits:
-            return []
-        consumed_ids = {item.id for item in hits}
-        self._commit([item for item in reminders if item.id not in consumed_ids])
-        return hits
+        with self._lock:
+            self.purge_expired(now)
+            reminders = self._ensure_loaded()
+            hits = [item for item in reminders if item.target_session_id == session_id and item.dispatched]
+            if not hits:
+                return []
+            consumed_ids = {item.id for item in hits}
+            self._commit([item for item in reminders if item.id not in consumed_ids])
+            return hits
 
     def revoke(self, reminder_id: str, now: float) -> Optional[Reminder]:
         """按编号撤销一条叮嘱；找不到时返回 None。"""
 
-        self.purge_expired(now)
-        normalized_id = str(reminder_id or "").strip().lstrip("#").lower()
-        for item in self._ensure_loaded():
-            if item.id != normalized_id:
-                continue
-            self._commit([candidate for candidate in self._ensure_loaded() if candidate.id != item.id])
-            return item
-        return None
+        with self._lock:
+            self.purge_expired(now)
+            normalized_id = str(reminder_id or "").strip().lstrip("#").lower()
+            for item in self._ensure_loaded():
+                if item.id != normalized_id:
+                    continue
+                self._commit([candidate for candidate in self._ensure_loaded() if candidate.id != item.id])
+                return item
+            return None
 
     def revoke_all(self, now: float) -> List[Reminder]:
         """撤销全部生效中的叮嘱，返回被撤销的条目。"""
 
-        self.purge_expired(now)
-        removed = list(self._ensure_loaded())
-        if removed:
-            self._commit([])
-        return removed
+        with self._lock:
+            self.purge_expired(now)
+            removed = list(self._ensure_loaded())
+            if removed:
+                self._commit([])
+            return removed
 
     @staticmethod
     def _new_id(existing_ids: Set[str]) -> str:

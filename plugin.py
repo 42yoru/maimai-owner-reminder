@@ -1034,7 +1034,11 @@ class OwnerReminderPlugin(MaiBotPlugin):
             return None, build_error_text(f"叮嘱没能保存：{exc}")
 
         try:
-            dispatch_note = await self._dispatch_reminder(reminder, mode=mode)
+            dispatch_note = (
+                "已关闭上下文注入，不朝目标流投递提醒；叮嘱仅按 TTL 保存。"
+                if not self.config.inject.enabled
+                else await self._dispatch_reminder(reminder, mode=mode)
+            )
         except Exception as exc:  # 投递出错也要让主人知道叮嘱已经生效，别以为命令没成功
             self.ctx.logger.error("朝目标流投递提醒异常: %s", exc, exc_info=True)
             dispatch_note = f"⚠️ 但提醒投递出错（{exc}）：叮嘱已保存，会在目标流下次自然触发时生效。"
